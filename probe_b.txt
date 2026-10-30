@@ -1,0 +1,22 @@
+    ConfigError,
+    default_config_path,
+    default_socket_path,
+    load_config,
+)
+from .recorder import RecorderError, detect_backend
+from .server import DictationServer
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_LEVELS = ("debug", "info", "warning", "error")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser for the daemon CLI."""
+    parser = argparse.ArgumentParser(
+        prog="sarvam-dictation-daemon",
+        description="Dictation daemon for the fcitx5 Sarvam addon "
+        "(audio capture + Sarvam AI speech-to-text over a Unix socket).",
+    )
+    parser.add_argument("--socket", metavar="PATH", default=None, help="Unix socket path to bind")
+    parser.add_argument("--config", metavar="PATH", default=None, help="path to config.toml")
+    parser.add_argument(
