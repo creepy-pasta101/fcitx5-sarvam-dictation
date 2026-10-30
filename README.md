@@ -32,7 +32,7 @@ Clone the repository and run the installer from the top of the checkout:
 ```bash
 git clone https://github.com/your-account/fcitx5-sarvam-dictation.git
 cd fcitx5-sarvam-dictation
-./scripts/install.sh
+bash scripts/install.sh
 ```
 
 The script builds the addon, installs it into the fcitx5 addon directory, and installs the daemon and the `sarvam-dictation-ctl` helper. Run it with `--help` to see the flags it accepts.
