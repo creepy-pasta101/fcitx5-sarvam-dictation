@@ -1,0 +1,15 @@
+[Addon]
+Name=Sarvam Dictation
+Comment=Voice dictation with Sarvam AI speech-to-text
+Category=Module
+Version=@PROJECT_VERSION@
+Library=libsarvamdictation
+Type=@FCITX_ADDON_TYPE@
+OnDemand=False
+Configurable=True
+
+[Addon/Dependencies]
+0=core:@PROJECT_VERSION@
+
+[Addon/OptionalDependencies]
+0=notifications
