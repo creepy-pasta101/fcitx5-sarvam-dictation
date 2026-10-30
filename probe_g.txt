@@ -1,0 +1,1 @@
+script. Logs go to stderr; SIGINT/SIGTERM shut the socket down cleanly.
