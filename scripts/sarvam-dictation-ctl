@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Control client for the sarvam-dictation daemon (standard library only).
+Speaks its newline-delimited JSON protocol over an AF_UNIX stream socket.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import uuid
+
+VERSION, MAX_LINE = 1, 1024 * 1024
+CONNECT_TIMEOUT = STATUS_TIMEOUT = 2.0
+RECORD_TIMEOUT = 300.0
+
+
+class ClientError(Exception):
+    """Raised when the daemon is unreachable, silent or answers badly."""
+
+
+def default_socket_path() -> str:
+    """Resolve the socket path exactly as the daemon and the addon do."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    return (os.path.join(runtime_dir, "sarvam-dictation.sock") if runtime_dir
+            else "/tmp/sarvam-dictation-{0}.sock".format(os.getuid()))
+
+
+def connect(path: str, timeout: float = CONNECT_TIMEOUT) -> socket.socket:
+    """Connect to the daemon, turning every failure into a readable error."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+    except FileNotFoundError:
+        sock.close()
+        raise ClientError("daemon is not running: no socket at {0}. Start it "
+                          "with 'sarvam-dictation-daemon' or enable the "
+                          "sarvam-dictation systemd user unit.".format(path)) from None
+    except ConnectionRefusedError:
+        sock.close()
+        raise ClientError("daemon is not running: nothing is listening on {0} "
+                          "(a stale socket file may be left over; the daemon "
+                          "replaces it on start).".format(path)) from None
+    except OSError as exc:
+        sock.close()
+        raise ClientError("cannot connect to {0}: {1}".format(path, exc)) from None
+    return sock
+
+
+def send(sock: socket.socket, message: dict) -> None:
+    """Write one protocol message to the daemon."""
+    sock.sendall(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
+
+
+def read_messages(sock: socket.socket, timeout: float):
+    """Yield decoded messages until the timeout expires or the peer closes.
+
+    Reuse one generator per connection: it owns the buffer, so replies that
+    arrive in the same read as an earlier one survive an early return.
+    """
+    deadline = time.monotonic() + timeout
+    buffer = b""
+    while (remaining := deadline - time.monotonic()) > 0:
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            return
+        except OSError as exc:
+            raise ClientError("connection failed: {0}".format(exc)) from None
+        if not chunk:
+            return
+        buffer += chunk
+        if len(buffer) > MAX_LINE:
+            raise ClientError("daemon sent a line longer than 1 MiB")
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            try:
+                message = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(message, dict):
+                yield message
+
+
+def wait(messages, msg_id, wanted: tuple) -> dict:
+    """Return the first `wanted`-typed reply to msg_id; raise on daemon error."""
+    for message in messages:
+        if message.get("id") not in (None, msg_id):
+            continue
+        if message.get("type") == "error":
+            raise ClientError("daemon error ({0}): {1}".format(
+                message.get("code", "unknown"), message.get("message", "")))
+        if message.get("type") in wanted:
+            return message
+    raise ClientError("daemon sent no reply")
+
+
+def run_status(path: str) -> int:
+    """Ping the daemon and print the state it reports (ping itself has none)."""
+    with connect(path) as sock:
+        send(sock, {"v": VERSION, "cmd": "ping"})
+        state, pong = None, False
+        for message in read_messages(sock, STATUS_TIMEOUT):
+            state = message.get("state", state)
+            pong = pong or message.get("type") == "pong"
+            if pong:
+                break
+        if not pong:  # the socket is up but the daemon never answered
+            raise ClientError("daemon did not answer ping")
+    print("daemon: running\nsocket: {0}\nstate: {1}".format(
+        path, state or "unknown (the daemon only broadcasts state on change)"))
+    return 0
+
+
+def run_simple_command(path: str, command: str) -> int:
+    """Send one command and report the daemon's answer."""
+    msg_id = uuid.uuid4().hex
+    with connect(path) as sock:
+        stream = read_messages(sock, RECORD_TIMEOUT)
+        send(sock, {"v": VERSION, "cmd": command, "id": msg_id})
+        answer = wait(stream, msg_id, ("state", "result"))
+        if answer.get("type") == "state" and answer.get("state") == "transcribing":
+            answer = wait(stream, msg_id, ("result",))  # stop: transcript follows
+        print("state: {0}".format(answer.get("state", "unknown"))
+              if answer.get("type") == "state" else answer.get("text", ""))
+    return 0
+
+
+def run_record(path: str, target: str) -> int:
+    """Record until Enter is pressed, then print and save the transcript."""
+    with connect(path) as sock:
+        stream = read_messages(sock, RECORD_TIMEOUT)
+        start_id = uuid.uuid4().hex
+        send(sock, {"v": VERSION, "cmd": "start", "id": start_id})
+        wait(stream, start_id, ("state",))
+        print("Recording. Press Enter to stop.", file=sys.stderr)
+        try:
+            input()
+        except EOFError:
+            pass
+        except KeyboardInterrupt:
+            send(sock, {"v": VERSION, "cmd": "cancel", "id": uuid.uuid4().hex})
+            print("\ncancelled", file=sys.stderr)
+            return 130
+        stop_id = uuid.uuid4().hex
+        send(sock, {"v": VERSION, "cmd": "stop", "id": stop_id})
+        text = wait(stream, stop_id, ("result",)).get("text", "")
+    print(text)
+    if target != "-":
+        try:
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError as exc:
+            raise ClientError("cannot write {0}: {1}".format(target, exc)) from None
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="sarvam-dictation-ctl",
+        description="Control the sarvam-dictation daemon over its Unix socket.")
+    parser.add_argument("--socket", metavar="PATH", default=None,
+                        help="socket path (default: $XDG_RUNTIME_DIR/sarvam-dictation.sock, "
+                             "else /tmp/sarvam-dictation-<uid>.sock)")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+    helps = {"status": "check that the daemon is running and print its state",
+             "start": "start recording", "stop": "stop recording and transcribe",
+             "toggle": "start when idle, stop when recording",
+             "cancel": "discard the current recording"}
+    for name, text in helps.items():
+        sub.add_parser(name, help=text)
+    record = sub.add_parser("record", help="record until Enter, then print the transcript")
+    record.add_argument("file", metavar="FILE", help="save the transcript here ('-' = print only)")
+    return parser
+
+
+def main(argv=None) -> int:
+    """Entry point: dispatch to the requested subcommand."""
+    args = build_parser().parse_args(argv)
+    path = args.socket or default_socket_path()
+    try:
+        if args.command == "status":
+            return run_status(path)
+        if args.command == "record":
+            return run_record(path, args.file)
+        return run_simple_command(path, args.command)
+    except ClientError as exc:
+        print("sarvam-dictation-ctl: {0}".format(exc), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
