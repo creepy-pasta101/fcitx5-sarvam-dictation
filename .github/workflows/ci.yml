@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python-tests:
+    name: Daemon tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        # The suite is deliberately written so that neither the sarvamai SDK nor
+        # any audio hardware is required: it injects fake recorder/transcriber
+        # objects, so only pytest is needed.
+        run: python -m pip install --upgrade pip pytest
+      - name: Run the suite
+        run: python -m pytest -q tests
+        env:
+          PYTHONPATH: daemon
+
+  cpp-build:
+    name: Addon build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the fcitx5 development packages
+        # fcitx5-modules-dev is the package that provides the Fcitx5Module CMake
+        # config and notifications_public.h; the addon will not configure
+        # without it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake gettext \
+            libfcitx5core-dev libfcitx5config-dev libfcitx5utils-dev \
+            fcitx5-modules-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Verify the installed layout
+        run: |
+          DESTDIR="$PWD/stage" cmake --install build
+          test -f stage/usr/lib/*/fcitx5/libsarvamdictation.so
+          test -f stage/usr/share/fcitx5/addon/sarvamdictation.conf
+          grep -q '^Library=libsarvamdictation$' stage/usr/share/fcitx5/addon/sarvamdictation.conf
+
+  install-scripts:
+    name: Shell and client script checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax-check the shell script
+        run: bash -n scripts/install.sh
+      - name: Syntax-check the client script
+        run: python -m py_compile scripts/sarvam-dictation-ctl
+      - name: The client script must fail cleanly with no daemon running
+        run: |
+          set +e
+          XDG_RUNTIME_DIR="$(mktemp -d)" python scripts/sarvam-dictation-ctl status
+          status=$?
+          set -e
+          test "$status" -ne 0
