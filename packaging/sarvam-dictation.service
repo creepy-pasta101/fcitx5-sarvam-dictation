@@ -1,0 +1,24 @@
+# systemd *user* unit for the sarvam-dictation daemon.
+#
+# Enable it with:
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now sarvam-dictation.service
+# (or copy it to ~/.config/systemd/user/sarvam-dictation.service first).
+#
+# This unit is optional: the fcitx5 addon's AutoStartDaemon option (default
+# true) forks the daemon itself on the first hotkey press, so a desktop session
+# that never enables this unit still works. Run only one of the two - a second
+# daemon cannot bind the same socket and will exit.
+
+[Unit]
+Description=Sarvam dictation daemon (Sarvam AI speech-to-text for fcitx5)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=sarvam-dictation-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
