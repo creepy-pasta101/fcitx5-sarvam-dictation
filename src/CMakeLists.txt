@@ -13,7 +13,8 @@ add_fcitx5_addon(sarvamdictation
     sarvamdictation.cpp
     sarvamdictationconfig.cpp
     tomlfile.cpp
-    desktopnotify.cpp)
+    desktopnotify.cpp
+    plasmaosd.cpp)
 
 target_link_libraries(sarvamdictation
     Fcitx5::Core

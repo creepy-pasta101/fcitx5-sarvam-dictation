@@ -55,6 +55,7 @@
 #include "fcitx/instance.h"
 
 #include "desktopnotify.h"
+#include "plasmaosd.h"
 
 namespace fcitx {
 
@@ -504,6 +505,14 @@ bool matchesKeyList(const Key &key, const KeyList &keys) {
         }
     }
     return false;
+}
+
+/// The value of an environment variable, or an empty string when it is unset.
+/// isPlasmaDesktop() takes plain strings, so an unset variable must not be
+/// passed as a null pointer.
+std::string environmentValue(const char *name) {
+    const char *value = std::getenv(name);
+    return value ? std::string(value) : std::string();
 }
 
 } // namespace
@@ -1035,12 +1044,14 @@ void SarvamDictation::handleLine(std::string_view line) {
         // reads it; see endPushToTalk().
         lastState_ = message.state;
         if (message.state == "recording") {
-            showTipMessage(_("Listening"),
-                           _("Press the hotkey again to stop."), kTipTimeout);
+            showRecordingIndicator(kAppIcon, _("Listening"),
+                                   _("Press the hotkey again to stop."));
         } else if (message.state == "transcribing") {
-            showTipMessage(_("Transcribing"),
-                           _("Converting your speech to text."), kTipTimeout);
+            showRecordingIndicator(kAppIcon, _("Transcribing"),
+                                   _("Converting your speech to text."));
         } else if (message.state == "idle") {
+            // The OSD has no handle to close: Plasma's indicator fades out on
+            // its own, so only the tip is dismissed here.
             closeTip();
         }
         return;
@@ -1266,6 +1277,29 @@ void SarvamDictation::spawnDaemon() {
     // immediately, so this does not meaningfully block the event loop.
     int status = 0;
     while (::waitpid(intermediate, &status, 0) < 0 && errno == EINTR) {
+    }
+}
+
+void SarvamDictation::showRecordingIndicator(const std::string &icon,
+                                             const std::string &summary,
+                                             const std::string &body) {
+    if (config_.showOsd.value()) {
+        // The desktop cannot change under a running fcitx5, so the answer is
+        // resolved once, in a function-local static: lazy (no getenv at
+        // startup), thread-safe without a lock of our own, and this runs on
+        // every state change, so caching it is worth the one static.
+        static const bool plasma = sarvam::isPlasmaDesktop(
+            environmentValue("XDG_CURRENT_DESKTOP"),
+            environmentValue("KDE_FULL_SESSION"));
+        if (plasma) {
+            // An OSD is a small centred indicator, not a paragraph: the body is
+            // tip material and is never sent to Plasma.
+            sarvam::showOsd(icon, summary);
+            return;
+        }
+    }
+    if (config_.showRecordingTips.value()) {
+        showTipMessage(summary, body, kTipTimeout);
     }
 }
 

@@ -221,6 +221,10 @@ FCITX_CONFIGURATION(
         true};
     Option<bool> showRecordingTips{
         this, "ShowRecordingTips", _("Show a tip while recording"), false};
+    // On by default: on KDE Plasma the recording indicator is Plasma's own OSD,
+    // which needs no configuration and is invisible on every other desktop.
+    Option<bool> showOsd{
+        this, "ShowOsd", _("Show an on-screen display on KDE Plasma"), true};
     Option<bool> appendSpace{
         this, "AppendSpace",
         _("Append a trailing space after the transcript"), true};);
