@@ -14,7 +14,8 @@ add_fcitx5_addon(sarvamdictation
     sarvamdictationconfig.cpp
     tomlfile.cpp
     desktopnotify.cpp
-    plasmaosd.cpp)
+    plasmaosd.cpp
+    clipboard.cpp)
 
 target_link_libraries(sarvamdictation
     Fcitx5::Core

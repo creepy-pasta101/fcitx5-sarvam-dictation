@@ -16,6 +16,7 @@
  */
 #include "../../src/desktopnotify.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,11 +26,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 using fcitx::sarvam::buildNotifySendCommand;
 using fcitx::sarvam::findInPath;
 using fcitx::sarvam::runDetached;
+using fcitx::sarvam::runDetachedWithInput;
 
 namespace {
 
@@ -351,11 +354,199 @@ void testRunDetached(const std::string &tmp) {
     }
 }
 
+// ---- runDetachedWithInput ------------------------------------------------
+
+/// The fake clipboard tool. It records how many arguments it was given and
+/// writes its standard input to a file, both through a rename, so the test sees
+/// a file appear only once its content is complete.
+const char kCaptureScript[] =
+    "#!/bin/sh\n"
+    "printf '%s\\n' \"$#\" > \"$SARVAM_CAPTURE_ARGC.part\" &&\n"
+    "    mv \"$SARVAM_CAPTURE_ARGC.part\" \"$SARVAM_CAPTURE_ARGC\" || exit 1\n"
+    "cat > \"$SARVAM_CAPTURE.part\" &&\n"
+    "    mv \"$SARVAM_CAPTURE.part\" \"$SARVAM_CAPTURE\"\n";
+
+/// A tool that drains its stdin and then lingers, to prove the caller does not
+/// wait for the child.
+const char kSlowCaptureScript[] = "#!/bin/sh\ncat > /dev/null\nsleep 2\n";
+
+void sleepMs(long milliseconds) {
+    struct timespec request;
+    request.tv_sec = milliseconds / 1000;
+    request.tv_nsec = (milliseconds % 1000) * 1000000L;
+    while (::nanosleep(&request, &request) != 0 && errno == EINTR) {
+    }
+}
+
+/// Poll for `path` to exist. The child is detached and runs asynchronously, so
+/// the capture file cannot be assumed to be there when the call returns.
+bool waitForFile(const std::string &path, long timeoutMs) {
+    for (long waited = 0; waited <= timeoutMs; waited += 10) {
+        if (::access(path.c_str(), F_OK) == 0) {
+            return true;
+        }
+        sleepMs(10);
+    }
+    return false;
+}
+
+bool readWholeFile(const std::string &path, std::string &content) {
+    content.clear();
+    std::FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return false;
+    }
+    char buffer[4096];
+    std::size_t count = 0;
+    while ((count = std::fread(buffer, 1, sizeof(buffer), file)) != 0) {
+        content.append(buffer, count);
+    }
+    const bool ok = std::ferror(file) == 0;
+    if (std::fclose(file) != 0) {
+        return false;
+    }
+    return ok;
+}
+
+/// A form that survives being printed on a single line.
+std::string printable(const std::string &value) {
+    std::string out;
+    for (const char character : value) {
+        const unsigned char byte = static_cast<unsigned char>(character);
+        if (character == '\n') {
+            out += "\\n";
+        } else if (byte < 0x20 || byte == 0x7f) {
+            out += '.';
+        } else {
+            out += character;
+        }
+    }
+    return out;
+}
+
+/// Run `argv` through runDetachedWithInput() with `input` and compare what the
+/// child actually read with `input`, plus the number of arguments it was given.
+bool expectCaptured(const std::string &name, const std::string &tmp,
+                    const std::vector<std::string> &argv,
+                    const std::string &input, long wantArgc) {
+    const std::string capture = tmp + "/sarvam-capture.txt";
+    const std::string argcFile = tmp + "/sarvam-capture-argc.txt";
+    ::unlink(capture.c_str());
+    ::unlink(argcFile.c_str());
+    ::unlink((capture + ".part").c_str());
+    ::unlink((argcFile + ".part").c_str());
+    if (::setenv("SARVAM_CAPTURE", capture.c_str(), 1) != 0 ||
+        ::setenv("SARVAM_CAPTURE_ARGC", argcFile.c_str(), 1) != 0) {
+        fail(name + "/setenv", "could not set the capture variables");
+        return false;
+    }
+
+    if (!runDetachedWithInput(argv, input)) {
+        fail(name + "/return", "runDetachedWithInput returned false");
+        return false;
+    }
+    if (!waitForFile(capture, 5000)) {
+        fail(name + "/capture", "the fake tool never wrote its stdin");
+        return false;
+    }
+
+    std::string got;
+    if (!readWholeFile(capture, got)) {
+        fail(name + "/read", "could not read the capture file");
+        return false;
+    }
+    if (got != input) {
+        fail(name + "/stdin", "got [" + printable(got) + "] want [" +
+                                  printable(input) + "]");
+        return false;
+    }
+
+    std::string argc;
+    if (!readWholeFile(argcFile, argc)) {
+        fail(name + "/argc-read", "could not read the argument count file");
+        return false;
+    }
+    if (argc != std::to_string(wantArgc) + "\n") {
+        fail(name + "/argc", "the tool was given [" + printable(argc) +
+                                 "] arguments, want [" +
+                                 std::to_string(wantArgc) + "]");
+        return false;
+    }
+    return true;
+}
+
+void testRunDetachedWithInput(const std::string &tmp) {
+    // Nothing to run: false without forking, exactly as in runDetached().
+    check("input/empty-argv",
+          !runDetachedWithInput(std::vector<std::string>(), "text"));
+    check("input/empty-executable",
+          !runDetachedWithInput(std::vector<std::string>{""}, "text"));
+
+    const std::string script = tmp + "/sarvam-capture-tool";
+    check("input/setup-script", writeFile(script, kCaptureScript, 0755));
+
+    // A transcript as it really looks: a newline and UTF-8 (Devanagari) in it,
+    // so the pipe is proved to carry bytes rather than a C string.
+    const std::string text =
+        "namaste\n"
+        "\xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4"
+        "\xe0\xa5\x87\n";
+
+    check("input/non-empty",
+          expectCaptured("input/non-empty", tmp, {script}, text, 0));
+
+    // An empty text still closes the pipe, so the tool sees an empty document
+    // and exits instead of waiting for input that will never come.
+    check("input/empty-text",
+          expectCaptured("input/empty-text", tmp, {script}, "", 0));
+
+    // Arguments are passed through untouched, and the text still arrives on
+    // stdin: this is the shape xclip and xsel use.
+    check("input/with-arguments",
+          expectCaptured("input/with-arguments", tmp,
+                         {script, "-selection", "clipboard"}, text, 2));
+
+    // A text far larger than one write is likely to carry, to exercise the
+    // partial-write loop.
+    std::string large;
+    for (int line = 0; line < 200; ++line) {
+        large += "line ";
+        large += std::to_string(line);
+        large += " of the transcript\n";
+    }
+    check("input/large-text",
+          expectCaptured("input/large-text", tmp, {script}, large, 0));
+
+    // The intermediate child must have been reaped, so this process has no
+    // children left to collect.
+    int status = 0;
+    check("input/no-zombie", ::waitpid(-1, &status, WNOHANG) < 0);
+
+    // Never blocks: the tool drains stdin and then sleeps, but the caller must
+    // not wait for it.
+    const std::string slow = tmp + "/sarvam-slow-capture";
+    check("input/setup-slow", writeFile(slow, kSlowCaptureScript, 0755));
+    const auto started = std::chrono::steady_clock::now();
+    const bool ok = runDetachedWithInput({slow}, text);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    check("input/slow-tool", ok);
+    if (elapsed >= 1000) {
+        fail("input/non-blocking",
+             "runDetachedWithInput took " + std::to_string(elapsed) + " ms");
+    }
+}
+
 // ---- cleanup -------------------------------------------------------------
 
 void cleanupTempDir(const std::string &tmp) {
     const char *names[] = {"sarvam-fake-notify-send", "sarvam-plain-file",
-                           "sarvam-slow", "sarvam-notify-dir"};
+                           "sarvam-slow", "sarvam-notify-dir",
+                           "sarvam-capture-tool", "sarvam-slow-capture",
+                           "sarvam-capture.txt", "sarvam-capture.txt.part",
+                           "sarvam-capture-argc.txt",
+                           "sarvam-capture-argc.txt.part"};
     for (const char *name : names) {
         const std::string path = tmp + "/" + name;
         ::unlink(path.c_str());
@@ -381,6 +572,7 @@ int main() {
         ::mkdir((tmp + "/sarvam-notify-dir").c_str(), 0755);
         testFindInPath(tmp);
         testRunDetached(tmp);
+        testRunDetachedWithInput(tmp);
         cleanupTempDir(tmp);
     }
 

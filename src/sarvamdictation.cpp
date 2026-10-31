@@ -54,6 +54,7 @@
 #include "fcitx/inputcontext.h"
 #include "fcitx/instance.h"
 
+#include "clipboard.h"
 #include "desktopnotify.h"
 #include "plasmaosd.h"
 
@@ -1371,25 +1372,83 @@ void SarvamDictation::showErrorNotification(const std::string &summary,
         << "no way to show a notification, dropping: " << summary;
 }
 
+void SarvamDictation::deliverToClipboard(const std::string &transcript) {
+    // The raw transcript, without the appended trailing space: that space
+    // exists to separate typed words, and on the clipboard it is only noise.
+    if (sarvam::copyToClipboard(transcript)) {
+        // A copy that worked is not an error, so it is announced through the
+        // recording indicator -- the Plasma OSD when that is on, the tip when
+        // that is on, nothing otherwise -- and never through
+        // showErrorNotification().
+        showRecordingIndicator(
+            kAppIcon, _("Copied to clipboard"),
+            _("Nothing was focused to type into, so the transcript is on your "
+              "clipboard."));
+        return;
+    }
+
+    // No clipboard tool could be run and nothing was typed either, so the text
+    // really is lost: this has to reach the user as an error, with the reason.
+    showErrorNotification(
+        _("Could not copy the transcript"),
+        _("Nothing was focused to type into and no clipboard tool (wl-copy, "
+          "xclip, xsel or Klipper over D-Bus) could be run, so the transcript "
+          "was lost."));
+}
+
 void SarvamDictation::commitTranscript(const std::string &transcript) {
     if (transcript.empty()) {
         // An empty transcript is legal in the protocol and commits nothing.
         return;
     }
+
+    InputContext *inputContext = targetInputContext_.get();
+    if (!inputContext) {
+        // The original client is gone. mostRecentInputContext() is still worth
+        // a look, but it may just as well belong to another application, so it
+        // is only typed into when it actually has focus.
+        inputContext = instance_->mostRecentInputContext();
+    }
+    const bool canType = inputContext && inputContext->hasFocus();
+
+    // No focused input context means the window went away or nothing accepts
+    // input. Committing into a stale context would put the text into whatever
+    // window happens to be most recent, possibly another application's, so the
+    // clipboard is the only safe destination. fcitx5 offers no capability flag
+    // that could tell us whether a focused client is really a text field, and
+    // treating "no surrounding text" as "not a text field" would redirect
+    // every terminal and most X11 clients here -- so the rule stays "no focus
+    // means clipboard".
+    if (!canType && config_.clipboardFallback.value()) {
+        deliverToClipboard(transcript);
+        return;
+    }
+
     std::string text = transcript;
     if (config_.appendSpace.value() && !endsWithWhitespace(text)) {
         text.push_back(' ');
     }
 
-    InputContext *inputContext = targetInputContext_.get();
-    if (!inputContext) {
-        // The original client is gone; use whatever the user is looking at now.
-        inputContext = instance_->mostRecentInputContext();
+    bool copyAttempted = false;
+    if (config_.clipboardAlways.value()) {
+        // Copy before committing: if the commit path does something
+        // unexpected, the clipboard copy has already happened.
+        deliverToClipboard(transcript);
+        copyAttempted = true;
     }
-    if (!inputContext) {
+
+    if (inputContext) {
+        inputContext->commitString(text);
         return;
     }
-    inputContext->commitString(text);
+
+    // There is no input context at all, so nothing was typed. When the copy has
+    // not been made yet it is the last resort, and its failure is reported by
+    // deliverToClipboard() as an error -- exactly one notification per failure,
+    // because a transcript must never disappear without the user being told.
+    if (!copyAttempted) {
+        deliverToClipboard(transcript);
+    }
 }
 
 class SarvamDictationFactory : public AddonFactory {

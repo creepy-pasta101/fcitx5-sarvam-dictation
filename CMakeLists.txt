@@ -95,6 +95,19 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
 
     add_test(NAME plasmaosd COMMAND plasmaosd_test)
+
+    # The clipboard module: the tool list, the per-tool argument vectors, and
+    # that the text really reaches the child on stdin.
+    add_executable(clipboard_test
+        tests/cpp/test_clipboard.cpp
+        src/clipboard.cpp
+        src/desktopnotify.cpp)
+
+    target_include_directories(clipboard_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
+
+    add_test(NAME clipboard COMMAND clipboard_test)
 endif()
 
 # Daemon-side install rules plus the CPack configuration (TGZ and RPM). Included

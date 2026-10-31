@@ -18,9 +18,11 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace fcitx::sarvam {
@@ -168,6 +170,129 @@ bool runDetached(const std::vector<std::string> &argv) {
     while (::waitpid(intermediate, &status, 0) < 0 && errno == EINTR) {
     }
     return true;
+}
+
+bool runDetachedWithInput(const std::vector<std::string> &argv,
+                          const std::string &input) {
+    if (argv.empty() || argv.front().empty()) {
+        return false;
+    }
+
+    // Built before the fork for the same reason as in runDetached(): after a
+    // fork in a multithreaded process only async-signal-safe calls are allowed,
+    // and malloc is not one of them.
+    std::vector<char *> raw;
+    raw.reserve(argv.size() + 1);
+    for (const std::string &argument : argv) {
+        raw.push_back(const_cast<char *>(argument.c_str()));
+    }
+    raw.push_back(nullptr);
+
+    const char *path = raw.front();
+    char *const *execArgv = raw.data();
+
+    // The pipe has to exist before the fork, so both sides inherit it.
+    int ends[2] = {-1, -1};
+    if (::pipe(ends) != 0) {
+        return false;
+    }
+    const int readEnd = ends[0];
+    const int writeEnd = ends[1];
+
+    const pid_t intermediate = ::fork();
+    if (intermediate < 0) {
+        ::close(readEnd);
+        ::close(writeEnd);
+        return false;
+    }
+    if (intermediate == 0) {
+        // This level never writes: its copy of the write end must go, or the
+        // worker would wait for an end-of-file that can never arrive.
+        ::close(writeEnd);
+        // Leave our session and process group, then fork the real worker, so it
+        // is never a direct child of the addon. Identical to runDetached().
+        ::setsid();
+        const pid_t worker = ::fork();
+        if (worker != 0) {
+            // Covers the worker (reparented to init) and a failed fork alike.
+            ::_exit(0);
+        }
+        // Only async-signal-safe calls from here on.
+        if (readEnd != STDIN_FILENO) {
+            if (::dup2(readEnd, STDIN_FILENO) < 0) {
+                ::_exit(127);
+            }
+            ::close(readEnd);
+        }
+        const int devNull = ::open("/dev/null", O_RDWR);
+        if (devNull >= 0) {
+            ::dup2(devNull, STDOUT_FILENO);
+            ::dup2(devNull, STDERR_FILENO);
+            if (devNull > STDERR_FILENO) {
+                ::close(devNull);
+            }
+        }
+        ::execv(path, execArgv);
+        ::_exit(127);
+    }
+
+    // Parent: the read end belongs to the child now. Keeping it open here would
+    // stop the child from ever seeing end-of-file.
+    ::close(readEnd);
+
+    // write() raises SIGPIPE when the reader is already gone, which is not an
+    // edge case: a missing binary exits 127 at once. fcitx5 is long-lived and
+    // must not die for that, so SIGPIPE is blocked for the duration of the
+    // write, the one instance it leaves pending is drained, and the old mask is
+    // restored afterwards. The write itself still reports EPIPE, which is
+    // reported as failure.
+    sigset_t blocked;
+    sigset_t previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    const bool masked = ::sigprocmask(SIG_BLOCK, &blocked, &previous) == 0;
+
+    // A loop, because write() may accept less than the whole buffer; EINTR is
+    // retried rather than truncating the text.
+    bool written = true;
+    const char *data = input.data();
+    std::size_t remaining = input.size();
+    while (remaining != 0) {
+        const ssize_t count = ::write(writeEnd, data, remaining);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            // EPIPE lands here: the child closed its stdin or never started.
+            written = false;
+            break;
+        }
+        if (count == 0) {
+            written = false;
+            break;
+        }
+        data += count;
+        remaining -= static_cast<std::size_t>(count);
+    }
+    // Closing the write end is what lets the child finish reading.
+    ::close(writeEnd);
+
+    if (masked) {
+        // The pending signal has to be consumed before the mask is restored,
+        // otherwise restoring it delivers SIGPIPE and kills the process.
+        const struct timespec noWait = {0, 0};
+        while (::sigtimedwait(&blocked, nullptr, &noWait) < 0 &&
+               errno == EINTR) {
+        }
+        ::sigprocmask(SIG_SETMASK, &previous, nullptr);
+    }
+
+    // Reap the intermediate exactly as runDetached() does. The worker is
+    // detached and deliberately not waited for.
+    int status = 0;
+    while (::waitpid(intermediate, &status, 0) < 0 && errno == EINTR) {
+    }
+    return written;
 }
 
 } // namespace fcitx::sarvam

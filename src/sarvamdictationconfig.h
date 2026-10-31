@@ -225,6 +225,21 @@ FCITX_CONFIGURATION(
     // which needs no configuration and is invisible on every other desktop.
     Option<bool> showOsd{
         this, "ShowOsd", _("Show an on-screen display on KDE Plasma"), true};
+    // Where the transcript goes when there is no focused input context to type
+    // into. fcitx5 exposes no "a text widget is focused" flag -- capability
+    // flags are not a substitute, X11/XIM clients advertise almost nothing --
+    // so the only decidable rule is "no focused context means clipboard".
+    Option<bool> clipboardFallback{
+        this, "ClipboardFallback",
+        _("Copy the transcript to the clipboard when nothing is focused to "
+          "type into"),
+        true};
+    // For applications that accept committed text and silently discard it (a
+    // browser page with no field focused): nothing can detect that case, so
+    // this copies as well, every time.
+    Option<bool> clipboardAlways{
+        this, "ClipboardAlways",
+        _("Always copy the transcript to the clipboard as well"), false};
     Option<bool> appendSpace{
         this, "AppendSpace",
         _("Append a trailing space after the transcript"), true};);
