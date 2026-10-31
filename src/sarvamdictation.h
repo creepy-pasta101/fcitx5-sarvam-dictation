@@ -120,6 +120,12 @@ private:
     void reportUnreachable();
     void spawnDaemon();
 
+    /// Show the recording indicator: the Plasma OSD when this is Plasma and
+    /// ShowOsd is on, otherwise the fcitx5 tip when ShowRecordingTips is on,
+    /// otherwise nothing. The OSD gets the summary only; `body` is tip material.
+    void showRecordingIndicator(const std::string &icon,
+                                const std::string &summary,
+                                const std::string &body);
     void showTipMessage(const std::string &summary, const std::string &body,
                         int32_t timeout);
     void closeTip();
