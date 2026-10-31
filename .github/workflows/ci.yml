@@ -48,6 +48,11 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --parallel
+      - name: Run the C++ unit tests
+        # The TOML subset reader/writer is the one part of the addon that can be
+        # tested without a running fcitx5, so it is the part CI actually checks
+        # the behaviour of rather than only the fact that it compiles.
+        run: ctest --test-dir build --output-on-failure
       - name: Verify the installed layout
         run: |
           DESTDIR="$PWD/stage" cmake --install build

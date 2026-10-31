@@ -2,12 +2,17 @@
 
 Layout is frozen by brief section 5; every value has a built-in default so a
 missing config file is never an error.
+
+Brief 2 adds one thing here and nothing else: a :class:`Config` remembers the
+path it was loaded from, so a running daemon can re-read *the same file* when
+the addon asks it to reload (brief section 6) without the caller having to
+remember the path a second time.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -51,6 +56,10 @@ class Config:
     backend: str = DEFAULT_BACKEND
     socket_path: str = ""
     max_duration_s: int = DEFAULT_MAX_DURATION_S
+    #: The file this configuration was read from; ``""`` when it was built by
+    #: hand. It takes no part in equality, hashing or ``repr``, so every
+    #: ``Config(...)`` comparison written before brief 2 keeps working.
+    config_path: str = field(default="", compare=False, repr=False)
 
 
 def default_config_path() -> Path:
@@ -97,7 +106,13 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
     if mode not in VALID_MODES:
         raise ConfigError(f"[api] mode {mode!r} is not one of {', '.join(VALID_MODES)}")
 
-    language_code = _string(api, "language_code", "", "[api] language_code")
+    # An empty language code means "detect it". fcitx5-configtool writes that as
+    # the empty string, but a hand-edited file may say "auto" (the config page's
+    # own wording); accepting both keeps the two spellings interchangeable and
+    # stops the literal string "auto" from being sent to the API as a tag.
+    language_code = _string(api, "language_code", "", "[api] language_code").strip()
+    if language_code.lower() in ("auto", "autodetect", "auto-detect"):
+        language_code = ""
     keyterms = _keyterms(api)
 
     file_key = _string(api, "key", "", "[api] key").strip()
@@ -130,7 +145,28 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
         backend=backend,
         socket_path=socket_path,
         max_duration_s=max_duration_s,
+        config_path=str(config_path),
     )
+
+
+def reload_config(path: Path | str | None = None, env: Mapping[str, str] | None = None) -> Config:
+    """Re-read the configuration file for the daemon's ``reload`` command.
+
+    Brief section 6 semantics, all of which fall out of :func:`load_config`:
+
+    * a missing file yields a :class:`Config` built from the built-in defaults
+      (exactly what happens at startup), so it is a success, not an error;
+    * a malformed file or an invalid value raises :class:`ConfigError` whose
+      message names the offending key (``[api] mode ...``), and the caller
+      keeps its previous settings;
+    * ``SARVAM_API_KEY`` still fills an empty ``[api] key``, so a reload
+      behaves the same as a fresh start.
+
+    ``path`` defaults to the built-in XDG location; pass the path the daemon
+    was started with (``Config.config_path``) to follow a ``--config``
+    override.
+    """
+    return load_config(None if path is None else Path(path), env)
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

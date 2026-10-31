@@ -4,6 +4,11 @@ One recording at a time; the connection that starts it owns it; state changes ar
 broadcast to every client while results and errors go only to the owner.
 Transcription runs in a worker thread so the socket stays responsive to ``ping``
 and ``cancel``.
+
+Brief 2 adds one client command, ``reload`` (section 6): re-read ``config.toml``
+from disk and apply it to *future* work. The settings of a job that is already
+recording or transcribing are snapshotted when it starts, so a reload can never
+change the audio settings or the API call of work in flight.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import socket
 from pathlib import Path
 
 from . import protocol
-from .config import Config, default_socket_path
+from .config import Config, ConfigError, default_config_path, default_socket_path, reload_config
 from .protocol import (
     MAX_LINE,
     STATE_IDLE,
@@ -40,6 +45,40 @@ DRAIN_TIMEOUT = 5.0
 PROBE_TIMEOUT = 1.0
 SHUTDOWN_TIMEOUT = 2.0
 
+#: The brief 2 client command (section 6). ``protocol.py`` is frozen, so the
+#: daemon accepts it through its own tuple rather than editing the protocol.
+RELOAD_COMMAND = "reload"
+
+#: Every command this server accepts: the frozen protocol set plus ``reload``.
+COMMANDS = tuple(dict.fromkeys(protocol.COMMANDS + (RELOAD_COMMAND,)))
+
+#: The brief 2 error code (section 6). It is not part of the frozen
+#: ``protocol.ERROR_CODES`` tuple, so the builder for it lives here.
+CONFIG_INVALID_CODE = "config_invalid"
+
+
+def reloaded_msg(msg_id: str) -> dict:
+    """Build the ``reloaded`` reply (brief section 6).
+
+    ``{"v":1,"type":"reloaded","id":"<uuid>"}`` and nothing else.
+    """
+    return {"v": protocol.VERSION, "type": "reloaded", "id": msg_id}
+
+
+def config_invalid_msg(message: str, msg_id: str | None) -> dict:
+    """Build the ``config_invalid`` error reply (brief section 6).
+
+    Same key set and order as :func:`sarvam_dictation.protocol.error_msg`, with
+    the new ``config_invalid`` code; the message names the offending key.
+    """
+    return {
+        "v": protocol.VERSION,
+        "type": "error",
+        "id": msg_id,
+        "code": CONFIG_INVALID_CODE,
+        "message": message,
+    }
+
 
 class _Client:
     """Per-connection state: the socket, its framer, and a closed flag."""
@@ -58,6 +97,11 @@ class DictationServer:
 
     The recorder and transcriber factories are injectable so tests can supply
     fakes without touching audio hardware or the network.
+
+    ``config_path`` is the file ``reload`` re-reads. When it is not given the
+    server uses the path its :class:`~sarvam_dictation.config.Config` was
+    loaded from (so ``--config`` is honoured) and otherwise the built-in XDG
+    location, which is the same file the daemon loads at startup.
     """
 
     def __init__(
@@ -67,10 +111,14 @@ class DictationServer:
         recorder_factory=None,
         transcriber_factory=None,
         socket_path: str | None = None,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self._config = config
-        self._recorder_factory = recorder_factory or (lambda: Recorder(config))
-        self._transcriber_factory = transcriber_factory or (lambda: SarvamTranscriber(config))
+        self._config_path = self._resolve_config_path(config, config_path)
+        self._recorder_factory = recorder_factory or (lambda: Recorder(self._job_config()))
+        self._transcriber_factory = transcriber_factory or (
+            lambda: SarvamTranscriber(self._job_config())
+        )
         self._socket_path = socket_path or config.socket_path or default_socket_path()
 
         self._server: asyncio.AbstractServer | None = None
@@ -84,6 +132,13 @@ class DictationServer:
         self._discard_result = False
         self._cancel_id: str | None = None
         self._lock = asyncio.Lock()
+        # Settings of the job currently recording/transcribing, captured when it
+        # started. ``None`` while idle. A reload replaces ``_config`` only, so
+        # work in flight always finishes with the settings it began with.
+        self._active_config: Config | None = None
+        # Every API key this process has seen, so a reload cannot leave the old
+        # key unscrubbed in a message that is still on its way out.
+        self._secrets: set[str] = {config.api_key} if config.api_key else set()
 
     @property
     def socket_path(self) -> str:
@@ -94,6 +149,28 @@ class DictationServer:
     def state(self) -> str:
         """Current protocol state, for diagnostics and tests."""
         return self._state
+
+    @property
+    def config(self) -> Config:
+        """The settings applied to the next recording (updated by ``reload``)."""
+        return self._config
+
+    @property
+    def config_path(self) -> Path:
+        """The file ``reload`` re-reads."""
+        return self._config_path
+
+    @staticmethod
+    def _resolve_config_path(
+        config: Config, config_path: str | os.PathLike[str] | None
+    ) -> Path:
+        """Pick the file to re-read: explicit argument, else the Config's own."""
+        if config_path is not None:
+            return Path(config_path)
+        loaded_from = getattr(config, "config_path", "")
+        if loaded_from:
+            return Path(loaded_from)
+        return default_config_path()
 
     async def start(self) -> None:
         """Bind the socket, removing a stale file only when nobody is listening."""
@@ -162,6 +239,7 @@ class DictationServer:
         self._state = STATE_IDLE
         self._owner = None
         self._owner_id = None
+        self._active_config = None
 
         with contextlib.suppress(FileNotFoundError, NotADirectoryError, PermissionError):
             os.unlink(self._socket_path)
@@ -222,6 +300,7 @@ class DictationServer:
                 self._owner = None
                 self._owner_id = None
                 self._state = STATE_IDLE
+                self._active_config = None
                 await self._stop_auto_stop()
                 if recorder is not None:
                     with contextlib.suppress(Exception):
@@ -275,7 +354,7 @@ class DictationServer:
             )
             return
         command = message.get("cmd")
-        if not isinstance(command, str) or command not in protocol.COMMANDS:
+        if not isinstance(command, str) or command not in COMMANDS:
             await self._send(client, error_msg("bad_request", f"unknown command {command!r}", None))
             return
         if command == "ping":
@@ -298,6 +377,8 @@ class DictationServer:
                 await self._cmd_start(client, msg_id)
             else:
                 await self._cmd_stop(client, msg_id)
+        elif command == RELOAD_COMMAND:
+            await self._cmd_reload(client, msg_id)
         else:  # cancel
             await self._cmd_cancel(client, msg_id)
 
@@ -307,15 +388,20 @@ class DictationServer:
             if self._state != STATE_IDLE:
                 await self._send(client, error_msg("busy", f"daemon is {self._state}", msg_id))
                 return
+            # Snapshot the settings this recording (and its transcription) will
+            # use, before a reload could replace them.
+            self._active_config = self._config
             recorder = self._recorder_factory()
             try:
                 await asyncio.to_thread(recorder.start)
             except RecorderError as exc:
                 logger.warning("cannot start recording: %s", exc)
+                self._active_config = None
                 await self._send(client, error_msg(_code_of(exc, "audio_failed"), str(exc), msg_id))
                 return
             except Exception as exc:
                 logger.exception("unexpected failure starting the recorder")
+                self._active_config = None
                 await self._send(
                     client, error_msg("internal", f"internal error: {exc.__class__.__name__}", msg_id)
                 )
@@ -378,11 +464,49 @@ class DictationServer:
             self._owner = None
             self._owner_id = None
             self._state = STATE_IDLE
+            self._active_config = None
             await self._stop_auto_stop()
             if recorder is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(recorder.cancel)
             await self._broadcast_state(STATE_IDLE, msg_id)
+
+    async def _cmd_reload(self, client: _Client, msg_id: str) -> None:
+        """Re-read the config file and apply it to future work (brief section 6).
+
+        Legal in every state: the file is read off the event loop, the new
+        settings are swapped in under the lock, and nothing else is touched -
+        no state change, no broadcast, no effect on the current recording or
+        transcription (those hold their own snapshot).
+        """
+        path = self._config_path
+        try:
+            new_config = await asyncio.to_thread(reload_config, path)
+        except ConfigError as exc:
+            message = self._scrub(str(exc))
+            logger.warning("reload rejected: %s", message)
+            await self._send(client, config_invalid_msg(message, msg_id))
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("unexpected failure while reloading the configuration")
+            await self._send(
+                client, error_msg("internal", f"internal error: {exc.__class__.__name__}", msg_id)
+            )
+            return
+
+        async with self._lock:
+            previous = self._config
+            self._config = new_config
+            if new_config.api_key:
+                self._secrets.add(new_config.api_key)
+            if new_config.socket_path != previous.socket_path:
+                logger.info(
+                    "socket_path is now %r; the listener stays on %s until a restart",
+                    new_config.socket_path,
+                    self._socket_path,
+                )
+        logger.info("configuration reloaded from %s", path)
+        await self._send(client, reloaded_msg(msg_id))
 
     # ------------------------------------------------------------ transcription
 
@@ -434,6 +558,7 @@ class DictationServer:
             self._owner = None
             self._owner_id = None
             self._transcribe_task = None
+            self._active_config = None
 
         if discard:
             await self._broadcast_state(STATE_IDLE, cancel_id)
@@ -459,7 +584,7 @@ class DictationServer:
 
     def _schedule_auto_stop(self, client: _Client, msg_id: str) -> None:
         """Arm the ``max_duration_s`` auto-stop for the current recording."""
-        limit = self._config.max_duration_s
+        limit = self._job_config().max_duration_s
         if limit <= 0:  # pragma: no cover - validation forbids this
             return
         self._auto_stop_task = asyncio.create_task(self._auto_stop(client, msg_id, float(limit)))
@@ -495,11 +620,21 @@ class DictationServer:
 
     # ------------------------------------------------------------------ helpers
 
+    def _job_config(self) -> Config:
+        """Settings for the job in flight, else the ones for the next job.
+
+        Called when a recorder or transcriber is constructed, so an in-flight
+        recording and its transcription both see the settings it started with
+        even if a ``reload`` arrived in between.
+        """
+        active = self._active_config
+        return active if active is not None else self._config
+
     def _scrub(self, text: str) -> str:
-        """Strip the API key from any message leaving the daemon."""
-        key = self._config.api_key
-        if key and len(key) >= 4:
-            return text.replace(key, "***")
+        """Strip every API key this daemon has seen from a message leaving it."""
+        for key in self._secrets:
+            if key and len(key) >= 4:
+                text = text.replace(key, "***")
         return text
 
     async def _is_socket_live(self, path: str) -> bool:
