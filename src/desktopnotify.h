@@ -33,6 +33,18 @@ std::vector<std::string> buildNotifySendCommand(const std::string &executable,
 /// is not an error here, the notification is simply lost.
 bool runDetached(const std::vector<std::string> &argv);
 
+/// Run argv in a detached child, writing `input` to its standard input.
+///
+/// The child is created the same way as in runDetached() (double fork, setsid,
+/// stdout/stderr on /dev/null), except that stdin is a pipe that receives
+/// `input` and is then closed. Transcripts are far smaller than a pipe buffer,
+/// so the write completes without the child having to read first; a partial
+/// write is still handled and never blocks the caller for long.
+///
+/// Returns false when the fork failed or when the input could not be written.
+bool runDetachedWithInput(const std::vector<std::string> &argv,
+                          const std::string &input);
+
 } // namespace fcitx::sarvam
 
 #endif
