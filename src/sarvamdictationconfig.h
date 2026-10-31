@@ -208,8 +208,19 @@ FCITX_CONFIGURATION(
                                       "DaemonCommand",
                                       _("Daemon command"),
                                       "sarvam-dictation-daemon"};
-    Option<bool> showNotifications{
-        this, "ShowNotifications", _("Show notification tips"), true};
+    KeyListOption pushToTalkKey{this,
+                                "PushToTalkKey",
+                                _("Push-to-talk key (hold to record)"),
+                                {Key("Control+Alt+space")},
+                                KeyListConstrain()};
+    // Quiet by default: nothing is shown while dictating. Failures still reach the
+    // user, through a desktop notification rather than a tip -- see
+    // SarvamDictation::showErrorNotification().
+    Option<bool> notifyOnError{
+        this, "NotifyOnError", _("Notify on errors (desktop notification)"),
+        true};
+    Option<bool> showRecordingTips{
+        this, "ShowRecordingTips", _("Show a tip while recording"), false};
     Option<bool> appendSpace{
         this, "AppendSpace",
         _("Append a trailing space after the transcript"), true};);

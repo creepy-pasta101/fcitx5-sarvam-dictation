@@ -54,6 +54,8 @@
 #include "fcitx/inputcontext.h"
 #include "fcitx/instance.h"
 
+#include "desktopnotify.h"
+
 namespace fcitx {
 
 namespace {
@@ -78,6 +80,14 @@ constexpr int32_t kTipTimeout = 3000;
 constexpr char kTipId[] = "sarvam-dictation";
 constexpr char kAppName[] = "fcitx5-sarvam-dictation";
 constexpr char kAppIcon[] = "audio-input-microphone";
+/// A push-to-talk hold shorter than this is a tap: it is cancelled instead of
+/// being uploaded. 200 ms of room noise transcribes to nothing useful, and a
+/// transcript pasted from an accidental tap is worse than no transcript.
+constexpr uint64_t kPushToTalkMinHoldUsec = 250 * 1000;
+/// How long an error stays in front of the user, as the notify-send
+/// expire-time and as the fcitx5 tip timeout. Errors are rare and are the one
+/// message that has to be noticed, so it may linger.
+constexpr int32_t kErrorNotificationTimeoutMs = 10000;
 
 #ifdef MSG_NOSIGNAL
 // A daemon that dies mid-write must not kill fcitx5 with SIGPIPE.
@@ -511,16 +521,72 @@ SarvamDictation::SarvamDictation(Instance *instance) : instance_(instance) {
         EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
         [this](Event &event) {
             auto &keyEvent = static_cast<KeyEvent &>(event);
-            // A press and its release both arrive here; acting on the release
-            // too would fire the hotkey twice.
+            const bool pushToTalkKey = matchesKeyList(
+                keyEvent.key(), config_.pushToTalkKey.value());
+
+            // A press and its release both arrive here. The release is the
+            // event that ends a push-to-talk hold; the toggle key still acts on
+            // the press alone, so a release of anything else stays ignored.
             if (keyEvent.isRelease()) {
+                if (pushToTalkKey && pushToTalkActive_) {
+                    keyEvent.filterAndAccept();
+                    endPushToTalk();
+                }
                 return;
             }
+
+            if (pushToTalkKey) {
+                // Ours either way, so the client never sees the key.
+                keyEvent.filterAndAccept();
+                if (pushToTalkActive_) {
+                    // X11 and Wayland deliver a press on every auto-repeat
+                    // interval while the key is held. Starting a session per
+                    // repeat would send "start" dozens of times a second and
+                    // the daemon would answer "busy" for all but the first.
+                    return;
+                }
+                if (lastState_ == "recording" || lastState_ == "transcribing") {
+                    // A recording started with the toggle key is already in
+                    // flight. "start" would be answered with "busy", and the
+                    // release would then send "cancel" - which is legal in
+                    // every state and would therefore silently throw away the
+                    // recording the toggle key started. Leave that session
+                    // alone; the key press does nothing.
+                    FCITX_SARVAMDICTATION_DEBUG()
+                        << "push-to-talk ignored, the daemon is already "
+                        << lastState_;
+                    return;
+                }
+                startPushToTalk(keyEvent.inputContext());
+                return;
+            }
+
             if (!matchesKeyList(keyEvent.key(), config_.triggerKey.value())) {
+                return;
+            }
+            if (pushToTalkActive_) {
+                // A hold is in progress. Toggling now would stop the recording
+                // that the release is about to stop, so the two modes would
+                // interleave; leave the event to the client untouched.
                 return;
             }
             keyEvent.filterAndAccept();
             onHotkey(keyEvent.inputContext());
+        }));
+
+    // A hold ends on a key release, and the release goes to whatever window has
+    // focus at that moment. If focus moves while the key is held - alt-tab, a
+    // window closing, a dialog appearing - the key-up never reaches us and the
+    // microphone would stay open. Treat the focus change as the release it
+    // effectively is. Registered here so eventHandlers_ owns its lifetime.
+    eventHandlers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextFocusOut, EventWatcherPhase::PreInputMethod,
+        [this](Event &) {
+            if (pushToTalkActive_) {
+                FCITX_SARVAMDICTATION_DEBUG()
+                    << "focus lost during push-to-talk, ending the recording";
+                endPushToTalk();
+            }
         }));
 
     // Two failure modes: some backends throw EventLoopException, others hand
@@ -564,11 +630,16 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     // what storing the daemon settings in config.toml is meant to avoid.
     RawConfig addonOnly;
     marshallOption(addonOnly["TriggerKey"], config_.triggerKey.value());
+    marshallOption(addonOnly["PushToTalkKey"],
+                   config_.pushToTalkKey.value());
     addonOnly.setValueByPath("AutoStartDaemon",
                              config_.autoStartDaemon.value() ? "True" : "False");
     addonOnly.setValueByPath("DaemonCommand", config_.daemonCommand.value());
+    addonOnly.setValueByPath("NotifyOnError",
+                             config_.notifyOnError.value() ? "True" : "False");
     addonOnly.setValueByPath(
-        "ShowNotifications", config_.showNotifications.value() ? "True" : "False");
+        "ShowRecordingTips",
+        config_.showRecordingTips.value() ? "True" : "False");
     addonOnly.setValueByPath("AppendSpace",
                              config_.appendSpace.value() ? "True" : "False");
     safeSaveAsIni(addonOnly, "conf/sarvamdictation.conf");
@@ -578,7 +649,7 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     if (!sarvam::saveDaemonConfig(config_, path, &error)) {
         FCITX_SARVAMDICTATION_DEBUG()
             << "cannot write " << path << ": " << error;
-        showTipMessage(_("Could not save settings"), error, kTipTimeout);
+        showErrorNotification(_("Could not save settings"), error);
         return;
     }
     // A daemon that is already running still holds the old values; tell it to
@@ -623,6 +694,66 @@ void SarvamDictation::onHotkey(InputContext *inputContext) {
     }
     FCITX_SARVAMDICTATION_DEBUG() << "hotkey pressed, command id " << id;
     queueCommand("{\"v\":1,\"cmd\":\"toggle\",\"id\":\"" + id + "\"}");
+}
+
+void SarvamDictation::startPushToTalk(InputContext *inputContext) {
+    pushToTalkActive_ = true;
+    pushToTalkStartUsec_ = now(CLOCK_MONOTONIC);
+    // Our "start" is about to change the daemon's state. Whatever was broadcast
+    // before this press describes a previous recording (or none at all) and must
+    // not be what the release decides on.
+    lastState_.clear();
+
+    if (inputContext) {
+        targetInputContext_ = inputContext->watch();
+    } else {
+        targetInputContext_.unwatch();
+    }
+
+    const std::string id = generateId();
+    pendingIds_.push_back(id);
+    if (pendingIds_.size() > kMaxPendingIds) {
+        pendingIds_.erase(pendingIds_.begin());
+    }
+    FCITX_SARVAMDICTATION_DEBUG() << "push-to-talk pressed, command id " << id;
+    queueCommand("{\"v\":1,\"cmd\":\"start\",\"id\":\"" + id + "\"}");
+}
+
+void SarvamDictation::endPushToTalk() {
+    if (!pushToTalkActive_) {
+        return;
+    }
+    pushToTalkActive_ = false;
+    const uint64_t heldUsec = now(CLOCK_MONOTONIC) - pushToTalkStartUsec_;
+    pushToTalkStartUsec_ = 0;
+
+    // Two reasons to cancel rather than stop:
+    //  - the hold was a tap, and a tap must not upload 200 ms of silence and
+    //    paste the (empty or wrong) transcript that comes back;
+    //  - the daemon is not known to be recording, either because "start" failed
+    //    or because it already auto-stopped at max_duration_s. "stop" outside
+    //    "recording" is answered with "busy", which would put a second error on
+    //    top of the real one the user already saw. "cancel" is legal in every
+    //    state, so it cannot produce an error of its own.
+    const bool tooShort = heldUsec < kPushToTalkMinHoldUsec;
+    const bool recording = lastState_ == "recording";
+    const std::string id = generateId();
+    if (tooShort || !recording) {
+        FCITX_SARVAMDICTATION_DEBUG()
+            << "push-to-talk released after " << heldUsec
+            << " us, last state '" << lastState_ << "', sending cancel";
+        queueCommand("{\"v\":1,\"cmd\":\"cancel\",\"id\":\"" + id + "\"}");
+        return;
+    }
+    // A result carries the id of the stop that produced it, so this id has to
+    // be remembered or the transcript would be dropped as stale.
+    pendingIds_.push_back(id);
+    if (pendingIds_.size() > kMaxPendingIds) {
+        pendingIds_.erase(pendingIds_.begin());
+    }
+    FCITX_SARVAMDICTATION_DEBUG()
+        << "push-to-talk released after " << heldUsec << " us, sending stop";
+    queueCommand("{\"v\":1,\"cmd\":\"stop\",\"id\":\"" + id + "\"}");
 }
 
 void SarvamDictation::queueCommand(const std::string &line) {
@@ -899,6 +1030,10 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "state") {
+        // The daemon broadcasts its state to every client, so this is the only
+        // authoritative answer to "am I recording?". The push-to-talk release
+        // reads it; see endPushToTalk().
+        lastState_ = message.state;
         if (message.state == "recording") {
             showTipMessage(_("Listening"),
                            _("Press the hotkey again to stop."), kTipTimeout);
@@ -946,7 +1081,7 @@ void SarvamDictation::handleLine(std::string_view line) {
             body += message.message;
             body += ")";
         }
-        showTipMessage(_("Sarvam dictation error"), body, kTipTimeout);
+        showErrorNotification(_("Sarvam dictation error"), body);
         return;
     }
 
@@ -1086,11 +1221,10 @@ void SarvamDictation::reportUnreachable() {
     retriesLeft_ = 0;
     spawnAttempted_ = false;
     FCITX_SARVAMDICTATION_DEBUG() << "daemon unreachable, giving up";
-    showTipMessage(
+    showErrorNotification(
         _("Sarvam dictation: daemon not reachable"),
         _("Start sarvam-dictation-daemon, or enable AutoStartDaemon in the "
-          "addon configuration."),
-        kTipTimeout);
+          "addon configuration."));
 }
 
 void SarvamDictation::spawnDaemon() {
@@ -1138,7 +1272,7 @@ void SarvamDictation::spawnDaemon() {
 void SarvamDictation::showTipMessage(const std::string &summary,
                                      const std::string &body,
                                      int32_t timeout) {
-    if (!config_.showNotifications.value()) {
+    if (!config_.showRecordingTips.value()) {
         return;
     }
     // The notifications module is an optional runtime dependency.
@@ -1151,7 +1285,7 @@ void SarvamDictation::showTipMessage(const std::string &summary,
 }
 
 void SarvamDictation::closeTip() {
-    if (!config_.showNotifications.value()) {
+    if (!config_.showRecordingTips.value()) {
         return;
     }
     // An empty summary and body is how a tip is dismissed.
@@ -1161,6 +1295,46 @@ void SarvamDictation::closeTip() {
                                          std::string(kAppIcon), std::string(),
                                          std::string(), 0);
     }
+}
+
+void SarvamDictation::showErrorNotification(const std::string &summary,
+                                            const std::string &body) {
+    // notify-send is resolved once, on the first error, through a function-local
+    // static: that is lazy (no $PATH walk at startup), thread-safe without a
+    // lock of our own, and needs no member to reset. $PATH cannot change under a
+    // running fcitx5, so caching the answer for the process lifetime is right.
+    if (config_.notifyOnError.value()) {
+        static const std::string notifySend = sarvam::findInPath("notify-send");
+        if (!notifySend.empty()) {
+            const std::vector<std::string> argv =
+                sarvam::buildNotifySendCommand(notifySend, summary, body,
+                                               kAppName, kAppIcon,
+                                               /*critical=*/true,
+                                               kErrorNotificationTimeoutMs);
+            if (!argv.empty() && sarvam::runDetached(argv)) {
+                return;
+            }
+        }
+    }
+
+    // No desktop notification, either because the option is off or because
+    // notify-send is missing or could not be run. Fall back to the fcitx5 tip
+    // regardless of ShowRecordingTips: a failed dictation that says nothing is
+    // indistinguishable from a hotkey that does not work, and the error is the
+    // one event that must always reach the user.
+    if (auto *n = notifications()) {
+        n->call<INotifications::showTip>(
+            std::string(kTipId), std::string(kAppName), std::string(kAppIcon),
+            summary, body, kErrorNotificationTimeoutMs);
+        return;
+    }
+
+    // Neither channel exists: no notify-send, no notifications module, or the
+    // option switched off. Log at warning level so the failure is at least
+    // diagnosable; the body is never logged, it can carry the daemon's error
+    // text.
+    FCITX_LOGC(::fcitx::sarvamdictation_log, Warn)
+        << "no way to show a notification, dropping: " << summary;
 }
 
 void SarvamDictation::commitTranscript(const std::string &transcript) {

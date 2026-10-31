@@ -11,6 +11,12 @@
  * (newline-delimited JSON, protocol version 1) which owns the microphone and
  * the speech-to-text call. Keeping the audio and HTTP work in another process
  * means a hung network call can never stall fcitx5's event loop.
+ *
+ * Two ways to dictate: the toggle key (press to start, press again to stop) and
+ * the push-to-talk key (hold to record, release to transcribe). Push-to-talk
+ * needs the key RELEASE, which is why the key watcher no longer returns early on
+ * a release event, and it needs a guard against auto-repeat, because a held key
+ * delivers one press per repeat interval.
  */
 #ifndef _FCITX5_SARVAM_DICTATION_SARVAMDICTATION_H_
 #define _FCITX5_SARVAM_DICTATION_SARVAMDICTATION_H_
@@ -90,6 +96,12 @@ private:
     std::string socketPath() const;
 
     void onHotkey(InputContext *inputContext);
+    /// Begin a push-to-talk recording: remember the client, stamp the press and
+    /// send "start". Only called when no session is active.
+    void startPushToTalk(InputContext *inputContext);
+    /// End a push-to-talk recording: send "stop" when the daemon broadcast
+    /// "recording", otherwise "cancel". Safe to call when no session is active.
+    void endPushToTalk();
     void queueCommand(const std::string &line);
 
     void startConnectAttempt(bool firstAttempt);
@@ -111,6 +123,12 @@ private:
     void showTipMessage(const std::string &summary, const std::string &body,
                         int32_t timeout);
     void closeTip();
+    /// Deliver an error to the user. Prefers a desktop notification via
+    /// notify-send so it is seen even when the fcitx5 notification daemon is
+    /// not running, and falls back to an fcitx5 tip when notify-send is not
+    /// installed.
+    void showErrorNotification(const std::string &summary,
+                               const std::string &body);
     void commitTranscript(const std::string &transcript);
 
     Instance *instance_;
@@ -130,6 +148,18 @@ private:
     // Cleared with the connection; keeps the connect-time reload to one per
     // connection instead of one per flushed command.
     bool reloadQueued_ = false;
+
+    // A push-to-talk session is open between the press that sends "start" and
+    // the release (or the focus loss) that ends it. While it is true a second
+    // press of the same key is auto-repeat and is swallowed.
+    bool pushToTalkActive_ = false;
+    // CLOCK_MONOTONIC microseconds of the press, so the hold can be measured
+    // without being disturbed by wall-clock changes.
+    uint64_t pushToTalkStartUsec_ = 0;
+    // The state of the last "state" message the daemon broadcast. The release
+    // sends "stop" only when this is "recording" and "cancel" otherwise; see
+    // endPushToTalk().
+    std::string lastState_;
 
     std::string readBuffer_;
     std::string writeBuffer_;
