@@ -136,6 +136,11 @@ private:
     void showErrorNotification(const std::string &summary,
                                const std::string &body);
     void commitTranscript(const std::string &transcript);
+    /// Put the raw transcript on the clipboard. Announces a successful copy
+    /// through showRecordingIndicator() -- a copy is not an error -- and
+    /// reports a failure through showErrorNotification(), because a failed copy
+    /// after nothing could be typed means the text really is lost.
+    void deliverToClipboard(const std::string &transcript);
 
     Instance *instance_;
     SarvamDictationConfig config_;
