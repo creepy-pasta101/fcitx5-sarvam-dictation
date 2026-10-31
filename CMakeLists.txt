@@ -16,6 +16,22 @@ endif()
 find_package(Fcitx5Core REQUIRED)
 find_package(Fcitx5Module REQUIRED COMPONENTS Notifications)
 
+# fcitx5 only looks for addons under its own prefix. With the CMake default
+# (/usr/local) a plain `cmake ..` would install the addon into
+# /usr/local/lib/fcitx5, where fcitx5 never looks, and the addon would silently
+# never appear in the configuration tool. Default the prefix to the prefix fcitx5
+# was built for, and leave an explicit -DCMAKE_INSTALL_PREFIX alone.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND FCITX_INSTALL_PREFIX)
+    set(CMAKE_INSTALL_PREFIX "${FCITX_INSTALL_PREFIX}" CACHE PATH
+        "Install path prefix, prepended onto install directories." FORCE)
+    message(STATUS
+        "sarvam-dictation: CMAKE_INSTALL_PREFIX defaulted to the fcitx5 prefix "
+        "(${FCITX_INSTALL_PREFIX}); pass -DCMAKE_INSTALL_PREFIX=... to override")
+endif()
+
+# Provides CMAKE_INSTALL_LIBDIR / BINDIR / DATADIR, which packaging.cmake uses.
+include(GNUInstallDirs)
+
 include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")
 
 add_subdirectory(src)
@@ -40,3 +56,9 @@ if(BUILD_TESTING)
 
     add_test(NAME tomlfile COMMAND tomlfile_test)
 endif()
+
+# Daemon-side install rules plus the CPack configuration (TGZ and RPM). Included
+# last so that every install rule in the project is known to CPack by the time it
+# reads the install tree, and so that PROJECT_VERSION and the Fcitx5 install
+# directories are already defined.
+include(packaging/packaging.cmake)

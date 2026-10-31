@@ -1,0 +1,12 @@
+#!@Python3_EXECUTABLE@
+# Installed by the fcitx5-sarvam-dictation package: this launcher exists so that
+# the RPM and deb packages do not depend on a pip-installed console script.
+# It is configured from packaging/sarvam-dictation-daemon.in by CMake (@ONLY).
+"""Start the sarvam-dictation daemon (installed as `sarvam-dictation-daemon`)."""
+
+import sys
+
+from sarvam_dictation.__main__ import main
+
+if __name__ == "__main__":
+    sys.exit(main())
