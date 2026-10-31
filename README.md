@@ -68,50 +68,135 @@ systemctl --user daemon-reload
 systemctl --user enable --now sarvam-dictation
 ```
 
-The addon starts the daemon by itself when it cannot reach one, but a service gives you a stable process with logs in the journal, which is easier to debug. If you run the service, you can turn the addon's `AutoStartDaemon` option off.
+The addon starts the daemon by itself when it cannot reach one, but a service gives you a stable process with logs in the journal, which is easier to debug. If you run the service, you can turn the addon's *Start the daemon automatically* option off.
+
+### Packages
+
+On Fedora and openSUSE the project also builds an RPM from the same source tree. Configure with the system prefix: a package build must use `-DCMAKE_INSTALL_PREFIX=/usr`, because fcitx5 looks for addons only in its own prefix, and an addon installed anywhere else is simply not found. Then build and run CPack:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build
+(cd build && cpack -G RPM)
+```
+
+The file that produces is named `fcitx5-sarvam-dictation-0.1.0-1.<arch>.rpm`, for example `fcitx5-sarvam-dictation-0.1.0-1.x86_64.rpm`. CI builds the same package on every push and publishes it as a build artifact on the workflow run, so if you would rather not build it yourself you can download it from there.
+
+Install it with `dnf`, which pulls in the `fcitx5` and `python3` dependencies the package declares:
+
+```bash
+sudo dnf install ./fcitx5-sarvam-dictation-*.rpm
+```
+
+The package installs both halves of the project, because neither is useful without the other: the addon library and its registration file under fcitx5's own directories, the `sarvam_dictation` Python package, the `sarvam-dictation-daemon` launcher the addon starts when it needs a daemon, the `sarvam-dictation-ctl` helper, and the systemd user unit at `/usr/lib/systemd/user/sarvam-dictation.service`. That unit is already in place after the install, so there is nothing to copy into your home directory; enable it directly:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now sarvam-dictation
+```
+
+What the package deliberately does not do is install the `sarvamai` Python SDK. That SDK is distributed on PyPI only and is not in Fedora's or openSUSE's repositories, so a hard dependency on it would make the package uninstallable. Install it yourself, for the interpreter the daemon runs under:
+
+```bash
+pip install sarvamai
+```
+
+Until you do, the daemon starts and answers `ping`, but a transcription attempt fails instead of returning a transcript. This is also why the API key setup step is unchanged: the key still goes into `~/.config/sarvam-dictation/config.toml`, which the configuration page writes for you, or into `SARVAM_API_KEY`. A package install changes where the binaries come from, not how they are configured. Once the package is installed, register the addon in `fcitx5-configtool` and restart fcitx5 exactly as described above.
 
 ## Configure
 
-The daemon reads `~/.config/sarvam-dictation/config.toml` (or `$XDG_CONFIG_HOME/sarvam-dictation/config.toml` when that variable is set). A missing file is not an error — every setting falls back to its default. A complete example:
+Every setting is edited in `fcitx5-configtool`, on the **Sarvam Dictation** addon page: open `fcitx5-configtool`, go to the *Addons* tab, select **Sarvam Dictation** and click *Configure*. The page holds the addon's own settings and the daemon's settings side by side, so you do not have to edit any file by hand.
+
+The page writes two files, because the two processes own different things:
+
+* `~/.config/sarvam-dictation/config.toml` (or `$XDG_CONFIG_HOME/sarvam-dictation/config.toml` when that variable is set) holds the API, audio and server settings — everything the daemon reads. This file holds your API key and is written with mode `0600`, so only you can read it.
+* `~/.config/fcitx5/conf/sarvamdictation.conf` holds the addon-only settings: the trigger key, the daemon command, the notification tips and the trailing space. The daemon has no interest in any of these, so they never enter `config.toml`.
+
+When you press *Apply*, the addon writes `config.toml` from the values on the page, then sends a `reload` command to the daemon over the socket. A running daemon re-reads the file and applies the new settings to the next recording — no restart of either process is needed.
+
+### Daemon settings
+
+These are the settings the daemon reads from `~/.config/sarvam-dictation/config.toml`. Each one appears on the configuration page with the label in the first column.
+
+| Setting | `config.toml` key | Default | Meaning |
+|---|---|---|---|
+| Sarvam API key | `[api] key` | empty | Your Sarvam AI key. Empty means the daemon falls back to the `SARVAM_API_KEY` environment variable. |
+| Model | `[api] model` | `saaras:v4` | Speech-to-text model: `saaras:v4` (recommended) or `saaras:v3`. |
+| Output mode | `[api] mode` | `transcribe` | What Saaras returns: `transcribe`, `translate`, `verbatim`, `translit` or `codemix`. |
+| Language | `[api] language_code` | empty | Spoken language. Empty means auto-detect, which is what the config page's *Auto-detect* entry writes; otherwise a code such as `hi-IN`, `bn-IN` or `ta-IN`. A hand-written `auto` is accepted too and treated as empty. |
+| Keyterms | `[api] keyterms` | `[]` | List of words and phrases to bias the model towards. `saaras:v4` only, at most 50 entries. |
+| Audio device | `[audio] device` | empty | Capture source. Empty means the system default source. |
+| Sample rate | `[audio] sample_rate` | `16000` | Recording sample rate: `16000` Hz (recommended) or `8000` Hz (telephony). |
+| Capture backend | `[audio] backend` | `auto` | Which capture program to use: `auto`, `pipewire` (`pw-record`), `pulse` (`parec`) or `alsa` (`arecord`). |
+| Socket path | `[server] socket_path` | empty | Path to the daemon socket. Empty means the default rule (`$XDG_RUNTIME_DIR/sarvam-dictation.sock`, else `/tmp/sarvam-dictation-<uid>.sock`). |
+| Max recording length (seconds) | `[server] max_duration_s` | `300` | Auto-stop and transcribe at this length. Accepts 5 to 3600. |
+
+### Addon settings
+
+These live in `~/.config/fcitx5/conf/sarvamdictation.conf` and are shown on the same page.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Trigger key | `Control+Alt+d` | Key combination that starts and stops dictation. Several combinations may be bound. |
+| Start the daemon automatically | `true` | Start the daemon command when the daemon cannot be reached. |
+| Daemon command | `sarvam-dictation-daemon` | Program the addon launches when autostarting. |
+| Show notification tips | `true` | Show "Listening…" and "Transcribing…" notification tips. |
+| Append a trailing space | `true` | Append a space after the committed transcript, so consecutive dictations do not run together. |
+
+The socket path used to be an addon setting; it is now `[server] socket_path` in `config.toml`. Both processes read it from there, so there is only one place to set it and the two sides cannot disagree.
+
+### The config file
+
+The file the page writes looks like this. A missing file is not an error — every setting falls back to its default.
 
 ```toml
+# Written by fcitx5-configtool via the fcitx5-sarvam-dictation addon.
+# The dictation daemon reads this file; edit it here or in fcitx5-configtool.
+
 [api]
-key = ""                # empty -> read env SARVAM_API_KEY
-model = "saaras:v4"     # or "saaras:v3"
-mode = "transcribe"     # transcribe | translate | verbatim | translit | codemix
-language_code = ""      # "" = auto-detect; else e.g. "hi-IN"
-keyterms = []           # list[str], saaras:v4 only, <=50 entries
+key = "YOUR_SARVAM_API_KEY"
+model = "saaras:v4"
+mode = "transcribe"
+language_code = ""          # empty = auto-detect
+keyterms = []
 
 [audio]
-device = ""             # "" = system default source
+device = ""
 sample_rate = 16000
-backend = "auto"        # auto | pipewire | pulse | alsa
+backend = "auto"
 
 [server]
-socket_path = ""        # "" = the default socket path rule
-max_duration_s = 300    # auto-stop and transcribe at this length
+socket_path = ""
+max_duration_s = 300
 ```
 
-The addon has its own options, which you edit in `fcitx5-configtool` under the addon's configuration page:
+### Hand-editing and precedence
 
-| Option | Default | Meaning |
-|---|---|---|
-| `TriggerKey` | `Control+Alt+d` | Key combination that starts and stops dictation. |
-| `SocketPath` | `""` | Path to the daemon socket; empty means the default rule (`$XDG_RUNTIME_DIR/sarvam-dictation.sock`, else `/tmp/sarvam-dictation-<uid>.sock`). Set this only if you override the daemon's `socket_path`. |
-| `AutoStartDaemon` | `true` | Start `DaemonCommand` when the daemon cannot be reached. |
-| `DaemonCommand` | `sarvam-dictation-daemon` | Program the addon launches when autostarting. |
-| `ShowNotifications` | `true` | Show "Listening…" and "Transcribing…" notification tips. |
-| `AppendSpace` | `true` | Append a space after the committed transcript, so consecutive dictations do not run together. |
+Hand-editing `config.toml` still works, and it is what standalone and systemd users do: the daemon reads the file at startup and on every `reload`, and it does not care who wrote it. Any key in the file that the addon does not manage — your own comments and extra keys — is preserved when the addon saves, so a hand edit outside the ten settings above survives.
 
-The API key can come from either the `key` field of `[api]` or the `SARVAM_API_KEY` environment variable. To keep the key in the file instead, replace the empty value with your own key, so the `[api]` section reads `key = "YOUR_SARVAM_API_KEY"` — the placeholder is exactly what belongs in anything you share or commit. The environment fills in only when the config file value is empty; an explicit key in the file is never shadowed by the environment. Keep the key out of version control — the file lives in your home directory, and if you keep dotfiles in git, add `sarvam-dictation/config.toml` to `.gitignore` rather than committing a real key. Never put a key in a repository, an issue, or a screenshot.
+The precedence rule is worth being plain about: pressing *Apply* in `fcitx5-configtool` rewrites the keys the page manages, using the values currently on the page. The page fills itself from `config.toml` when the addon loads its configuration, so a hand edit made while fcitx5 is running is not reflected on the page and is overwritten by the next *Apply*. If you edit the file by hand while fcitx5 is running, make the edit in `fcitx5-configtool` as well, or reload and check the page before you press *Apply*.
+
+After a hand edit, tell the daemon to pick it up:
+
+```bash
+sarvam-dictation-ctl reload
+```
+
+The same command is useful when you want to confirm that the daemon accepts the file: it answers with a `reloaded` message, or with an error naming the offending key.
+
+### The API key
+
+The key is stored in plain text in `config.toml`, which is why that file is mode `0600` and why the key never goes into `~/.config/fcitx5/conf/sarvamdictation.conf` — a second copy in a second file would be one more thing to leak and one more thing to keep in step. Keep the key out of version control: the file lives in your home directory, and if you keep dotfiles in git, add `sarvam-dictation/config.toml` to `.gitignore` rather than committing a real key. Never put a key in a repository, an issue, or a screenshot; in anything you share, use the placeholder `YOUR_SARVAM_API_KEY`.
+
+The key can also come from the `SARVAM_API_KEY` environment variable, which fills in only when the file's value is empty; an explicit key in the file is never shadowed by the environment.
 
 ## Usage
 
-Press `Control+Alt+d` (or whatever you bound to `TriggerKey`). A notification appears saying *Listening…* and the daemon starts recording from your default source. Press the same hotkey again: the notification changes to *Transcribing…*, the recording is finalised and sent to Sarvam, and when the answer comes back the text is committed into the field that had focus when you first pressed the hotkey, followed by a space if `AppendSpace` is on. The notification closes when the daemon returns to idle.
+Press `Control+Alt+d` (or whatever you bound to the trigger key). A notification appears saying *Listening…* and the daemon starts recording from your default source. Press the same hotkey again: the notification changes to *Transcribing…*, the recording is finalised and sent to Sarvam, and when the answer comes back the text is committed into the field that had focus when you first pressed the hotkey, followed by a space if *Append a trailing space* is on. The notification closes when the daemon returns to idle.
 
-The `mode` setting chooses what Saaras does with your speech. `transcribe` is the everyday choice: speech in, text in the same language's own script. `translate` returns the transcript in English, which is useful when you speak an Indian language but need English text. `verbatim` keeps the disfluencies and false starts rather than tidying them away, which is what you want for interview or meeting notes where the exact wording matters. `translit` returns romanised text instead of native script, useful for names, addresses and anything you will read back over a phone line. `codemix` is for speech that mixes languages inside a sentence, such as Hindi with English technical words, and preserves that mixture instead of forcing one language. Leave `language_code` empty to let the service detect the language; set it (for example `hi-IN`) when you know it, since detection on a short utterance is the most common source of a wrong-language transcript.
+The output mode chooses what Saaras does with your speech. `transcribe` is the everyday choice: speech in, text in the same language's own script. `translate` returns the transcript in English, which is useful when you speak an Indian language but need English text. `verbatim` keeps the disfluencies and false starts rather than tidying them away, which is what you want for interview or meeting notes where the exact wording matters. `translit` returns romanised text instead of native script, useful for names, addresses and anything you will read back over a phone line. `codemix` is for speech that mixes languages inside a sentence, such as Hindi with English technical words, and preserves that mixture instead of forcing one language. Leave the language on *Auto-detect* to let the service detect it; set a code (for example `hi-IN`) when you know it, since detection on a short utterance is the most common source of a wrong-language transcript.
 
-The REST endpoint accepts audio up to about 30 seconds per request, so the daemon splits anything longer into 28-second chunks, transcribes them in order and joins the pieces with single spaces. You do not have to think about this: hold the hotkey session open for a two-minute thought and it works. The `max_duration_s` setting (default 300) stops the recording automatically at that length so a forgotten session cannot run forever.
+The REST endpoint accepts audio up to about 30 seconds per request, so the daemon splits anything longer into 28-second chunks, transcribes them in order and joins the pieces with single spaces. You do not have to think about this: hold the hotkey session open for a two-minute thought and it works. The max recording length setting (default 300 seconds) stops the recording automatically at that length so a forgotten session cannot run forever.
 
 To check the daemon without involving fcitx5 at all, record from a terminal:
 
@@ -121,18 +206,22 @@ sarvam-dictation-ctl record out.wav
 
 Speak, press Enter, and you get a WAV file plus the transcript the daemon produced. This is the fastest way to tell whether a problem is in the audio path, in the API call, or in the addon. From a checkout that has not been installed, the same command is `./scripts/sarvam-dictation-ctl record out.wav`.
 
+The helper speaks the same protocol as the addon and has one command per client message: `status`, `start`, `stop`, `toggle`, `cancel`, `reload` and `record`. `sarvam-dictation-ctl reload` asks a running daemon to re-read `config.toml` and apply it to the next recording, which is what you want after editing the file outside `fcitx5-configtool`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
 |---|---|
-| "Sarvam dictation: daemon not reachable" | The addon could not connect and gave up after retrying for five seconds. Start the daemon in the foreground (`sarvam-dictation-daemon --log-level debug`) and watch its output. If it starts fine, the two sides disagree about the socket path: check `socket_path` in the daemon config and `SocketPath` in the addon options. |
-| `no_audio_device` error | No capture program was found, or the configured device does not exist. Install PipeWire or PulseAudio utilities so `pw-record` or `parec` is on `PATH`, or set `[audio] device` to a real source. `sarvam-dictation-daemon --check` reports which backend it resolved. |
-| `audio_failed` error | The recorder produced zero-length or unreadable audio — usually a wrong `device`, or the capture process died immediately. Confirm the source works with `pw-record`/`parec`/`arecord` on the command line first. |
-| `401` or `api` error | The API key is missing, wrong, or out of quota. Check `key` in `~/.config/sarvam-dictation/config.toml` or `SARVAM_API_KEY`, and that the key is active on the dashboard. A key that was pasted with surrounding whitespace counts as wrong. |
+| "Sarvam dictation: daemon not reachable" | The addon could not connect and gave up after retrying for five seconds. Start the daemon in the foreground (`sarvam-dictation-daemon --log-level debug`) and watch its output. If it starts fine, the two sides disagree about the socket path: check `[server] socket_path` on the addon's configuration page, which is the one place both processes read it from. |
+| `no_audio_device` error | No capture program was found, or the configured device does not exist. Install PipeWire or PulseAudio utilities so `pw-record` or `parec` is on `PATH`, or set the audio device to a real source. `sarvam-dictation-daemon --check` reports which backend it resolved. |
+| `audio_failed` error | The recorder produced zero-length or unreadable audio — usually a wrong audio device, or the capture process died immediately. Confirm the source works with `pw-record`/`parec`/`arecord` on the command line first. |
+| `401` or `api` error | The API key is missing, wrong, or out of quota. Check the Sarvam API key field on the configuration page (that is `[api] key` in `~/.config/sarvam-dictation/config.toml`) or `SARVAM_API_KEY`, and that the key is active on the dashboard. A key that was pasted with surrounding whitespace counts as wrong. |
 | `no_api_key` error | Neither the config file nor the environment has a key. `sarvam-dictation-daemon --check` states plainly whether a key is present. |
-| Empty transcript, nothing inserted | The daemon transcribed silence or noise and returned an empty string, which is a legal result and commits nothing. Check the microphone is not muted and that `[audio] device` points at it; raise your input level and try a longer utterance. |
+| `config_invalid` error | The daemon rejected the config file and kept its previous settings, so dictation still works. The message names the offending key; fix that value in `fcitx5-configtool` and press *Apply*, or correct the file and run `sarvam-dictation-ctl reload`. |
+| Settings on the page revert after you edit the file by hand | The page is filled from `config.toml` when fcitx5 loads the addon, and *Apply* rewrites the keys it manages. Make the change on the page, or reload fcitx5 before pressing *Apply*. |
+| Empty transcript, nothing inserted | The daemon transcribed silence or noise and returned an empty string, which is a legal result and commits nothing. Check the microphone is not muted and that the audio device points at it; raise your input level and try a longer utterance. |
 | Text is transcribed but does not appear in the application | The application may not be using fcitx5 at all. Electron and some GTK applications only get text committed through fcitx5's own frontend: make sure the app is running under Wayland with `GTK_IM_MODULE=fcitx`/`QT_IM_MODULE=fcitx`, or under X11 with `XMODIFIERS=@im=fcitx`, and that fcitx5's Wayland or X11 frontend is the one the app connects to. Also check whether the window that had focus was closed while transcribing — the text then goes to the most recent input context, which may be a different window. |
-| Hotkey does nothing, or does the wrong thing | Another binding owns `Control+Alt+d`. Change `TriggerKey` in the addon's configuration page, or free the key in your desktop's keyboard settings. Bindings grabbed by the compositor never reach fcitx5. |
+| Hotkey does nothing, or does the wrong thing | Another binding owns `Control+Alt+d`. Change the trigger key in the addon's configuration page, or free the key in your desktop's keyboard settings. Bindings grabbed by the compositor never reach fcitx5. |
 | Need to see what happened | Daemon logs go to the journal when it runs as a service: `journalctl --user -u sarvam-dictation -f`. For a foreground daemon, raise the level with `sarvam-dictation-daemon --log-level debug`. For the addon, restart fcitx5 in verbose mode with `fcitx5 -rd --verbose`. |
 
 `sarvam-dictation-daemon --check` is the single most useful diagnostic: it validates the config file, reports the resolved audio backend and device, says whether an API key is present, and exits non-zero if something is wrong.
@@ -147,9 +236,11 @@ pytest -q tests
 
 The protocol lives in two places, and they must stay in step: `daemon/sarvam_dictation/protocol.py` on the Python side and `src/sarvamdictation.cpp` on the C++ side. [docs/PROTOCOL.md](docs/PROTOCOL.md) describes the same contract in prose, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains why the pieces are arranged the way they are.
 
+The config file is read and written by a dependency-free TOML subset reader in `src/tomlfile.cpp`, which preserves keys it does not manage. The addon's option definitions are in `src/sarvamdictationconfig.cpp`: that is where a new setting is declared, and where the mapping between an fcitx5 option and its `config.toml` key is kept.
+
 ## Privacy
 
-Your audio is uploaded to Sarvam AI's API to be transcribed. That is the whole point of the tool, and it means the audio leaves your machine and is handled under Sarvam's terms. Nothing else is retained: the daemon writes a temporary WAV in a temporary directory, transcribes it, and deletes it. There is no history, no database, no analytics, and no storage of transcripts by this project. If you would rather not send a given piece of audio to a remote service, do not dictate it.
+Your audio is uploaded to Sarvam AI's API to be transcribed. That is the whole point of the tool, and it means the audio leaves your machine and is handled under Sarvam's terms. Nothing else is retained: the daemon writes a temporary WAV in a temporary directory, transcribes it, and deletes it. There is no history, no database, no analytics, and no storage of transcripts by this project. The API key sits in one file, `~/.config/sarvam-dictation/config.toml`, readable only by you. If you would rather not send a given piece of audio to a remote service, do not dictate it.
 
 ## License
 

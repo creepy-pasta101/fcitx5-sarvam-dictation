@@ -12,6 +12,7 @@ import json
 import pytest
 
 from sarvam_dictation.protocol import (
+    COMMANDS as PROTOCOL_COMMANDS,
     MAX_LINE,
     STATE_IDLE,
     STATE_RECORDING,
@@ -24,6 +25,12 @@ from sarvam_dictation.protocol import (
     error_msg,
     result_msg,
     state_msg,
+)
+from sarvam_dictation.server import (
+    COMMANDS as SERVER_COMMANDS,
+    RELOAD_COMMAND,
+    config_invalid_msg,
+    reloaded_msg,
 )
 
 
@@ -290,3 +297,67 @@ def test_builders_produce_encodable_compact_messages(builder_call):
     else:
         message = builder_call("id", "text", None, 1, 1)
     assert decode_line(encode(message)) == message
+
+
+# --------------------------------------------------------------------------
+# brief 2, section 6: reload / reloaded / config_invalid
+#
+# protocol.py is frozen, so these two builders live in server.py. They are
+# checked here, next to the other wire shapes, because the addon parses them.
+# --------------------------------------------------------------------------
+
+
+def test_reload_is_a_command_the_server_accepts():
+    assert RELOAD_COMMAND == "reload"
+    assert "reload" in SERVER_COMMANDS
+    # Everything the frozen protocol already defined must still be accepted.
+    assert set(PROTOCOL_COMMANDS) <= set(SERVER_COMMANDS)
+
+
+def test_reloaded_msg_has_exactly_the_documented_keys():
+    message = reloaded_msg("abc123")
+    assert set(message) == {"v", "type", "id"}
+    assert list(message) == ["v", "type", "id"]
+    assert message["v"] == 1
+    assert message["type"] == "reloaded"
+    assert message["id"] == "abc123"
+
+
+def test_config_invalid_msg_has_exactly_the_documented_keys():
+    message = config_invalid_msg(
+        "[api] mode 'shout' is not one of transcribe, translate", "abc123"
+    )
+    assert set(message) == {"v", "type", "id", "code", "message"}
+    assert list(message) == ["v", "type", "id", "code", "message"]
+    assert message["v"] == 1
+    assert message["type"] == "error"
+    assert message["code"] == "config_invalid"
+    assert message["id"] == "abc123"
+    assert "[api] mode" in message["message"]
+
+
+def test_config_invalid_msg_allows_a_null_id():
+    message = config_invalid_msg("malformed TOML", None)
+    assert message["id"] is None
+    assert message["code"] == "config_invalid"
+
+
+def test_reload_builders_produce_encodable_compact_messages():
+    for message in (
+        reloaded_msg("abc123"),
+        config_invalid_msg("[audio] backend 'x' is invalid", "abc123"),
+    ):
+        data = encode(message)
+        assert data.endswith(b"\n")
+        assert b'": ' not in data
+        assert b", " not in data
+        assert decode_line(data) == message
+
+
+def test_reload_messages_round_trip_through_the_line_reader():
+    reader = LineReader()
+    data = encode(reloaded_msg("a1")) + encode(config_invalid_msg("[api] model", "b2"))
+    assert reader.feed(data) == [
+        reloaded_msg("a1"),
+        config_invalid_msg("[api] model", "b2"),
+    ]

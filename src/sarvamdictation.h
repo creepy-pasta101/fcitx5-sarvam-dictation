@@ -36,30 +36,13 @@
 #include "fcitx/inputcontext.h"
 #include "fcitx/instance.h"
 #include "notifications_public.h"
+#include "sarvamdictationconfig.h"
 
 namespace fcitx {
 
-FCITX_CONFIGURATION(
-    SarvamDictationConfig,
-    KeyListOption triggerKey{this,
-                             "TriggerKey",
-                             _("Trigger Key"),
-                             {Key("Control+Alt+d")},
-                             KeyListConstrain()};
-    Option<std::string> socketPath{
-        this, "SocketPath", _("Socket Path"), ""};
-    Option<bool> autoStartDaemon{
-        this, "AutoStartDaemon", _("Start the daemon automatically"), true};
-    Option<std::string> daemonCommand{this,
-                                      "DaemonCommand",
-                                      _("Daemon Command"),
-                                      "sarvam-dictation-daemon"};
-    Option<bool> showNotifications{
-        this, "ShowNotifications", _("Show notification tips"), true};
-    Option<bool> appendSpace{this,
-                             "AppendSpace",
-                             _("Append a trailing space after the transcript"),
-                             true};);
+// The configuration class lives in fcitx::sarvam with the rest of the settings
+// code; the addon keeps using the bare name.
+using sarvam::SarvamDictationConfig;
 
 /**
  * A dictation addon instance.
@@ -79,10 +62,15 @@ public:
 
     void reloadConfig() override;
     const Configuration *getConfig() const override { return &config_; }
-    void setConfig(const RawConfig &config) override {
-        config_.load(config, true);
-        safeSaveAsIni(config_, "conf/sarvamdictation.conf");
-    }
+    void setConfig(const RawConfig &config) override;
+
+    /// Ask a running daemon to re-read config.toml (after the config page saved
+    /// it, or when a connection is first established).
+    void sendReload();
+
+    /// Queue the one-shot reload that precedes the first command on a new
+    /// connection, so a recording never starts on stale settings.
+    void queueReloadOnConnect();
 
 private:
     /// Result of a single non-blocking connect attempt.
@@ -139,6 +127,9 @@ private:
     bool connecting_ = false;
     int retriesLeft_ = 0;
     bool spawnAttempted_ = false;
+    // Cleared with the connection; keeps the connect-time reload to one per
+    // connection instead of one per flushed command.
+    bool reloadQueued_ = false;
 
     std::string readBuffer_;
     std::string writeBuffer_;

@@ -129,6 +129,17 @@ def run_simple_command(path: str, command: str) -> int:
     return 0
 
 
+def run_reload(path: str) -> int:
+    """Ask the daemon to re-read config.toml and report the outcome."""
+    msg_id = uuid.uuid4().hex
+    with connect(path) as sock:
+        stream = read_messages(sock, STATUS_TIMEOUT)
+        send(sock, {"v": VERSION, "cmd": "reload", "id": msg_id})
+        wait(stream, msg_id, ("reloaded",))
+    print("config: reloaded (applies to the next recording)")
+    return 0
+
+
 def run_record(path: str, target: str) -> int:
     """Record until Enter is pressed, then print and save the transcript."""
     with connect(path) as sock:
@@ -170,7 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
     helps = {"status": "check that the daemon is running and print its state",
              "start": "start recording", "stop": "stop recording and transcribe",
              "toggle": "start when idle, stop when recording",
-             "cancel": "discard the current recording"}
+             "cancel": "discard the current recording",
+             "reload": "re-read config.toml and apply it to future recordings"}
     for name, text in helps.items():
         sub.add_parser(name, help=text)
     record = sub.add_parser("record", help="record until Enter, then print the transcript")
@@ -187,6 +199,8 @@ def main(argv=None) -> int:
             return run_status(path)
         if args.command == "record":
             return run_record(path, args.file)
+        if args.command == "reload":
+            return run_reload(path)
         return run_simple_command(path, args.command)
     except ClientError as exc:
         print("sarvam-dictation-ctl: {0}".format(exc), file=sys.stderr)
