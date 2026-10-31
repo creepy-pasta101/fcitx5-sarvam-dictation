@@ -19,3 +19,24 @@ find_package(Fcitx5Module REQUIRED COMPONENTS Notifications)
 include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")
 
 add_subdirectory(src)
+
+# include(CTest) defines the BUILD_TESTING option (default ON) and calls
+# enable_testing(), which is what makes add_test() below visible to ctest.
+include(CTest)
+
+if(BUILD_TESTING)
+    # The TOML subset has no fcitx5 includes at all, so its unit test builds
+    # against the plain standard library: it needs neither Fcitx5::Core nor the
+    # addon target, and it must be buildable on a machine that has no fcitx5
+    # development package installed.
+    add_executable(tomlfile_test
+        tests/cpp/test_tomlfile.cpp
+        src/tomlfile.cpp)
+
+    target_include_directories(tomlfile_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+
+    add_test(NAME tomlfile COMMAND tomlfile_test)
+endif()

@@ -543,7 +543,52 @@ SarvamDictation::SarvamDictation(Instance *instance) : instance_(instance) {
 SarvamDictation::~SarvamDictation() { closeSocket(); }
 
 void SarvamDictation::reloadConfig() {
+    // Two files, one config page: the addon's own settings come from the fcitx5
+    // conf, the daemon's settings from the TOML file the daemon reads too.
     readAsIni(config_, "conf/sarvamdictation.conf");
+    const std::string path = sarvam::daemonConfigPath();
+    std::string error;
+    if (!sarvam::loadDaemonConfig(config_, path, &error)) {
+        // Never fail the addon over a bad file: the daemon settings keep their
+        // defaults and the user sees the reason when they press Apply.
+        FCITX_SARVAMDICTATION_DEBUG()
+            << "cannot read " << path << ": " << error;
+    }
+}
+
+void SarvamDictation::setConfig(const RawConfig &config) {
+    config_.load(config, true);
+
+    // Only the addon's own options may reach the fcitx5 conf. Writing the whole
+    // Configuration would put the API key into a second file, which is exactly
+    // what storing the daemon settings in config.toml is meant to avoid.
+    RawConfig addonOnly;
+    marshallOption(addonOnly["TriggerKey"], config_.triggerKey.value());
+    addonOnly.setValueByPath("AutoStartDaemon",
+                             config_.autoStartDaemon.value() ? "True" : "False");
+    addonOnly.setValueByPath("DaemonCommand", config_.daemonCommand.value());
+    addonOnly.setValueByPath(
+        "ShowNotifications", config_.showNotifications.value() ? "True" : "False");
+    addonOnly.setValueByPath("AppendSpace",
+                             config_.appendSpace.value() ? "True" : "False");
+    safeSaveAsIni(addonOnly, "conf/sarvamdictation.conf");
+
+    const std::string path = sarvam::daemonConfigPath();
+    std::string error;
+    if (!sarvam::saveDaemonConfig(config_, path, &error)) {
+        FCITX_SARVAMDICTATION_DEBUG()
+            << "cannot write " << path << ": " << error;
+        showTipMessage(_("Could not save settings"), error, kTipTimeout);
+        return;
+    }
+    // A daemon that is already running still holds the old values; tell it to
+    // re-read the file it just got.
+    sendReload();
+}
+
+void SarvamDictation::sendReload() {
+    const std::string id = generateId();
+    queueCommand("{\"v\":1,\"cmd\":\"reload\",\"id\":\"" + id + "\"}");
 }
 
 std::string SarvamDictation::socketPath() const {
@@ -608,6 +653,7 @@ void SarvamDictation::startConnectAttempt(bool firstAttempt) {
     int error = 0;
     const ConnectResult result = connectOnce(&error);
     if (result == ConnectResult::Connected) {
+        queueReloadOnConnect();
         flushPending();
         return;
     }
@@ -768,6 +814,7 @@ bool SarvamDictation::handleIO(EventSourceIO *source, int fd,
             source->setEvents(IOEventFlag::In);
         }
         FCITX_SARVAMDICTATION_DEBUG() << "connect completed";
+        queueReloadOnConnect();
         return flushPending();
     }
 
@@ -978,6 +1025,22 @@ void SarvamDictation::closeSocket() {
     // Queued commands refer to a connection that no longer exists; replaying a
     // stale "toggle" later would be worse than dropping it.
     pendingLines_.clear();
+    reloadQueued_ = false;
+}
+
+void SarvamDictation::queueReloadOnConnect() {
+    if (reloadQueued_) {
+        return;
+    }
+    reloadQueued_ = true;
+    // A daemon started long before this fcitx5 session may still be running on
+    // an older config.toml, and the settings may have been changed in
+    // fcitx5-configtool while it was not running. Re-read the file before the
+    // queued command starts a recording, hence the insert at the front.
+    const std::string id = generateId();
+    pendingLines_.insert(
+        pendingLines_.begin(),
+        "{\"v\":1,\"cmd\":\"reload\",\"id\":\"" + id + "\"}");
 }
 
 void SarvamDictation::scheduleRetry() {

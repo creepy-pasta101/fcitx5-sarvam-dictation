@@ -4,7 +4,15 @@
 #
 # add_fcitx5_addon takes the sources directly: it forwards them to add_library,
 # which refuses an empty source list at configure time.
-add_fcitx5_addon(sarvamdictation sarvamdictation.cpp)
+#
+# sarvamdictationconfig.cpp holds the configuration surface and the TOML
+# load/save entry points; tomlfile.cpp is the dependency-free TOML reader and
+# writer it sits on. Both are part of the addon rather than a separate library
+# so that the addon stays one .so with no runtime lookup.
+add_fcitx5_addon(sarvamdictation
+    sarvamdictation.cpp
+    sarvamdictationconfig.cpp
+    tomlfile.cpp)
 
 target_link_libraries(sarvamdictation
     Fcitx5::Core
