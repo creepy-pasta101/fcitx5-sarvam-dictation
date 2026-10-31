@@ -11,7 +11,10 @@ SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build"
 
-PREFIX="/usr/local"
+# Empty means "let CMake decide": the project defaults the prefix to the prefix
+# fcitx5 itself was built for, which is where fcitx5 looks for addons. Passing
+# /usr/local here would install the addon somewhere fcitx5 never searches.
+PREFIX=""
 INSTALL_DAEMON=1
 USER_PREFIX=0
 
@@ -25,7 +28,7 @@ Usage: install.sh [OPTIONS]
 Build and install the fcitx5-sarvam-dictation addon into an fcitx5 prefix.
 
 Options:
-  --prefix PATH   CMake install prefix (default: /usr/local)
+  --prefix PATH   CMake install prefix (default: the fcitx5 prefix, usually /usr)
   --user          Install into ~/.local instead of a system prefix
   --no-daemon     Install only the addon, skip the Python daemon
   -h, --help      Show this help and exit
@@ -78,11 +81,14 @@ if [ "${USER_PREFIX}" -eq 1 ]; then
     PREFIX="${HOME}/.local"
 fi
 
-[ -n "${PREFIX}" ] || die "--prefix must not be empty"
-case "${PREFIX}" in
-    /*) ;;
-    *) die "--prefix must be an absolute path, got '${PREFIX}'" ;;
-esac
+# An empty prefix is the normal case: CMake then defaults it to the fcitx5
+# prefix. Only a prefix the user actually asked for has to be absolute.
+if [ -n "${PREFIX}" ]; then
+    case "${PREFIX}" in
+        /*) ;;
+        *) die "--prefix must be an absolute path, got '${PREFIX}'" ;;
+    esac
+fi
 
 [ -f "${REPO_ROOT}/CMakeLists.txt" ] || die "no CMakeLists.txt in ${REPO_ROOT}; run this script from a full checkout of the repository"
 
@@ -136,10 +142,16 @@ fi
 
 # ---------------------------------------------------------------------- build
 
-info "configuring the addon (prefix: ${PREFIX})"
+if [ -n "${PREFIX}" ]; then
+    info "configuring the addon (prefix: ${PREFIX})"
+    PREFIX_ARG=(-DCMAKE_INSTALL_PREFIX="${PREFIX}")
+else
+    info "configuring the addon (prefix: the fcitx5 prefix)"
+    PREFIX_ARG=()
+fi
 if ! cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="${PREFIX}"; then
+        "${PREFIX_ARG[@]}"; then
     die "cmake configuration failed; the messages above say which fcitx5 package is missing"
 fi
 

@@ -45,7 +45,9 @@ jobs:
             libfcitx5core-dev libfcitx5config-dev libfcitx5utils-dev \
             fcitx5-modules-dev
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        # /usr is not decoration: fcitx5 only loads addons from its own prefix,
+        # so a package install must use the same prefix fcitx5 was built with.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
       - name: Build
         run: cmake --build build --parallel
       - name: Run the C++ unit tests
@@ -55,10 +57,83 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Verify the installed layout
         run: |
+          set -eux
           DESTDIR="$PWD/stage" cmake --install build
+          # The addon and its registration file, under the prefix we configured.
           test -f stage/usr/lib/*/fcitx5/libsarvamdictation.so
           test -f stage/usr/share/fcitx5/addon/sarvamdictation.conf
           grep -q '^Library=libsarvamdictation$' stage/usr/share/fcitx5/addon/sarvamdictation.conf
+          # The daemon half of the package: launcher, client, systemd user unit.
+          test -x stage/usr/bin/sarvam-dictation-daemon
+          test -x stage/usr/bin/sarvam-dictation-ctl
+          test -f stage/usr/lib/systemd/user/sarvam-dictation.service
+          # The site-packages directory differs between distributions (and Debian
+          # uses dist-packages for its system interpreter), so find it rather
+          # than assuming a path.
+          site="$(dirname "$(dirname "$(find stage -path '*sarvam_dictation/__main__.py' | head -n1)")")"
+          test -n "$site"
+          # The launcher must be runnable and resolve the package it installs.
+          PYTHONPATH="$site" stage/usr/bin/sarvam-dictation-daemon --version
+      - name: The default install prefix must be the fcitx5 prefix
+        # Without this the addon lands in /usr/local, where fcitx5 never looks.
+        run: |
+          set -eux
+          cmake -S . -B build-default
+          grep -E '^CMAKE_INSTALL_PREFIX:PATH=/usr$' build-default/CMakeCache.txt
+
+  rpm:
+    name: RPM package
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install the build and packaging tools
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            cmake gcc-c++ make rpm-build python3 fcitx5-devel
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Run the C++ unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Build the RPM
+        run: |
+          set -eux
+          cd build
+          cpack -G RPM
+          ls -l ./*.rpm
+      - name: Inspect the package
+        # A package that builds but installs the wrong files is worse than no
+        # package, so the file list is checked rather than assumed.
+        run: |
+          set -eux
+          cd build
+          rpm_file="$(ls ./*.rpm | head -n1)"
+          rpm -qip "$rpm_file"
+          rpm -qlp "$rpm_file" | tee filelist.txt
+          grep -Eq '^/usr/lib(64)?/fcitx5/libsarvamdictation\.so$' filelist.txt
+          grep -qx '/usr/share/fcitx5/addon/sarvamdictation.conf' filelist.txt
+          grep -qx '/usr/bin/sarvam-dictation-daemon' filelist.txt
+          grep -qx '/usr/bin/sarvam-dictation-ctl' filelist.txt
+          grep -qx '/usr/lib/systemd/user/sarvam-dictation.service' filelist.txt
+          grep -Eq '^/usr/lib(64)?/python3\.[0-9]+/(site|dist)-packages/sarvam_dictation/__main__\.py$' filelist.txt
+      - name: Install the package
+        # rpm -i into the container proves the dependencies resolve and the
+        # scriptlets and file list are consistent.
+        run: |
+          set -eux
+          cd build
+          dnf -y install ./fcitx5-sarvam-dictation-*.rpm
+          rpm -V fcitx5-sarvam-dictation
+          test -f /usr/lib64/fcitx5/libsarvamdictation.so
+          sarvam-dictation-daemon --version
+          sarvam-dictation-ctl --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fcitx5-sarvam-dictation-rpm
+          path: build/*.rpm
+          if-no-files-found: error
 
   install-scripts:
     name: Shell and client script checks

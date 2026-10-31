@@ -70,6 +70,39 @@ systemctl --user enable --now sarvam-dictation
 
 The addon starts the daemon by itself when it cannot reach one, but a service gives you a stable process with logs in the journal, which is easier to debug. If you run the service, you can turn the addon's *Start the daemon automatically* option off.
 
+### Packages
+
+On Fedora and openSUSE the project also builds an RPM from the same source tree. Configure with the system prefix: a package build must use `-DCMAKE_INSTALL_PREFIX=/usr`, because fcitx5 looks for addons only in its own prefix, and an addon installed anywhere else is simply not found. Then build and run CPack:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build
+(cd build && cpack -G RPM)
+```
+
+The file that produces is named `fcitx5-sarvam-dictation-0.1.0-1.<arch>.rpm`, for example `fcitx5-sarvam-dictation-0.1.0-1.x86_64.rpm`. CI builds the same package on every push and publishes it as a build artifact on the workflow run, so if you would rather not build it yourself you can download it from there.
+
+Install it with `dnf`, which pulls in the `fcitx5` and `python3` dependencies the package declares:
+
+```bash
+sudo dnf install ./fcitx5-sarvam-dictation-*.rpm
+```
+
+The package installs both halves of the project, because neither is useful without the other: the addon library and its registration file under fcitx5's own directories, the `sarvam_dictation` Python package, the `sarvam-dictation-daemon` launcher the addon starts when it needs a daemon, the `sarvam-dictation-ctl` helper, and the systemd user unit at `/usr/lib/systemd/user/sarvam-dictation.service`. That unit is already in place after the install, so there is nothing to copy into your home directory; enable it directly:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now sarvam-dictation
+```
+
+What the package deliberately does not do is install the `sarvamai` Python SDK. That SDK is distributed on PyPI only and is not in Fedora's or openSUSE's repositories, so a hard dependency on it would make the package uninstallable. Install it yourself, for the interpreter the daemon runs under:
+
+```bash
+pip install sarvamai
+```
+
+Until you do, the daemon starts and answers `ping`, but a transcription attempt fails instead of returning a transcript. This is also why the API key setup step is unchanged: the key still goes into `~/.config/sarvam-dictation/config.toml`, which the configuration page writes for you, or into `SARVAM_API_KEY`. A package install changes where the binaries come from, not how they are configured. Once the package is installed, register the addon in `fcitx5-configtool` and restart fcitx5 exactly as described above.
+
 ## Configure
 
 Every setting is edited in `fcitx5-configtool`, on the **Sarvam Dictation** addon page: open `fcitx5-configtool`, go to the *Addons* tab, select **Sarvam Dictation** and click *Configure*. The page holds the addon's own settings and the daemon's settings side by side, so you do not have to edit any file by hand.
