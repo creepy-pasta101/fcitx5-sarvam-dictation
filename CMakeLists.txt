@@ -82,6 +82,19 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
 
     add_test(NAME desktopnotify COMMAND desktopnotify_test)
+
+    # The Plasma OSD helper: desktop detection and the per-client argument
+    # vectors, which is all of it that can be checked without a Plasma session.
+    add_executable(plasmaosd_test
+        tests/cpp/test_plasmaosd.cpp
+        src/plasmaosd.cpp
+        src/desktopnotify.cpp)
+
+    target_include_directories(plasmaosd_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
+
+    add_test(NAME plasmaosd COMMAND plasmaosd_test)
 endif()
 
 # Daemon-side install rules plus the CPack configuration (TGZ and RPM). Included
