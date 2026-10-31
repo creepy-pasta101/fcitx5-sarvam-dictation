@@ -29,46 +29,46 @@ endif()
 
 # Where the daemon package goes.
 #
-# Python3_SITEARCH is absolute (/usr/lib/python3.13/site-packages on Fedora, and
-# whatever the interpreter's own prefix is elsewhere). Passing an absolute path
-# to install(DESTINATION) is used verbatim by CMake, so with -DCMAKE_INSTALL_PREFIX=/usr
-# the tree would be written straight into the build host's /usr and CPack would
-# either double the prefix or refuse to relocate the file. The relocatable form
-# is the path relative to the interpreter's own prefix: "lib/python3.13/site-packages".
+# Python3_SITEARCH is absolute, and it must be installed *relative to the prefix*
+# rather than verbatim: CPack cannot relocate an absolute DESTINATION, so it would
+# try to write into the build host's real /usr and fail with "Permission denied"
+# for any non-root build.
 #
-# It is derived from the interpreter rather than by string-matching the install
-# prefix on Python3_SITEARCH, because "/usr" is a textual prefix of "/usr/local"
-# and stripping it would silently yield "local/lib/python3.12/site-packages".
-set(_sarvam_python_fallback
-    "${CMAKE_INSTALL_LIBDIR}/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages")
-set(_sarvam_python_site_rel "")
+# file(RELATIVE_PATH) is what makes this correct, because it compares path
+# components instead of strings. With a /usr prefix and an interpreter in
+# /usr/local it yields "local/lib/python3.12/site-packages", which is exactly
+# where that interpreter looks; a naive strip would give the same answer here but
+# breaks the other way round. When the interpreter is outside the prefix
+# altogether the result starts with "..", and only then do we fall back to the
+# conventional layout. Note the deliberate "lib": Python never uses lib64 or a
+# multiarch directory, so CMAKE_INSTALL_LIBDIR is the wrong variable here.
+set(_sarvam_python_fallback "lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages")
+set(_sarvam_python_site "${_sarvam_python_fallback}")
 
-execute_process(
-    COMMAND "${Python3_EXECUTABLE}" -c
-            "import os, sysconfig; print(os.path.relpath(sysconfig.get_path('platlib'), sys.prefix))"
-    OUTPUT_VARIABLE _sarvam_python_site_rel
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    RESULT_VARIABLE _sarvam_python_probe_result)
-
-if(NOT _sarvam_python_probe_result EQUAL 0 OR NOT _sarvam_python_site_rel
-   OR IS_ABSOLUTE "${_sarvam_python_site_rel}" OR _sarvam_python_site_rel MATCHES "^\.\.")
-    # Either the probe failed or the interpreter lives outside any sensible
-    # prefix. Fall back to the conventional layout below the install libdir.
+if(Python3_SITEARCH)
+    file(RELATIVE_PATH _sarvam_python_site_rel "${CMAKE_INSTALL_PREFIX}" "${Python3_SITEARCH}")
+    if(IS_ABSOLUTE "${_sarvam_python_site_rel}" OR _sarvam_python_site_rel MATCHES "^\.\.")
+        message(WARNING
+            "The interpreter's site-packages (${Python3_SITEARCH}) is outside "
+            "CMAKE_INSTALL_PREFIX (${CMAKE_INSTALL_PREFIX}), so the daemon is "
+            "installed to ${_sarvam_python_fallback} instead. Pass "
+            "-D_sarvam_python_site_rel=<relative path> to override.")
+    else()
+        set(_sarvam_python_site "${_sarvam_python_site_rel}")
+    endif()
+else()
     message(WARNING
-        "Could not derive the Python package directory from ${Python3_EXECUTABLE}; "
-        "installing the daemon to ${_sarvam_python_fallback} instead. Override "
-        "-D_sarvam_python_site_rel=<rel/path> if that is wrong for this distribution.")
-    set(_sarvam_python_site_rel "${_sarvam_python_fallback}")
+        "Python3_SITEARCH is empty; installing the daemon to ${_sarvam_python_fallback}. "
+        "Pass -D_sarvam_python_site_rel=<relative path> if that is wrong here.")
 endif()
 
-message(STATUS "sarvam-dictation: Python package destination: ${_sarvam_python_site_rel}")
+message(STATUS "sarvam-dictation: Python package destination: ${_sarvam_python_site}")
 
 # 1a. The Python package. Only the sources are packaged: FILES_MATCHING alone
 #     still creates the directories it walks, so __pycache__ has to be excluded
 #     explicitly or the package ships an empty (or stale) byte-code directory.
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/daemon/sarvam_dictation/"
-        DESTINATION "${_sarvam_python_site_rel}/sarvam_dictation"
+        DESTINATION "${_sarvam_python_site}/sarvam_dictation"
         FILES_MATCHING
         PATTERN "*.py"
         PATTERN "__pycache__" EXCLUDE
@@ -87,10 +87,13 @@ install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/sarvam-dictation-daemon"
 install(PROGRAMS "${PROJECT_SOURCE_DIR}/scripts/sarvam-dictation-ctl"
         DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
-# 1d. The systemd *user* unit. It belongs in /usr/lib/systemd/user on Fedora and
-#     on Debian, not in share/systemd.
+# 1d. The systemd *user* unit. systemd looks in /usr/lib/systemd/user on every
+#     distribution -- not in lib64, not in the multiarch libdir, and not in
+#     share/systemd -- so this path is spelled out instead of using
+#     CMAKE_INSTALL_LIBDIR, which would put it in /usr/lib64/systemd/user on
+#     Fedora where systemd never looks.
 install(FILES "${PROJECT_SOURCE_DIR}/packaging/sarvam-dictation.service"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user")
+        DESTINATION "lib/systemd/user")
 
 # 1e. Licence and README, into the usual documentation directory.
 install(FILES "${PROJECT_SOURCE_DIR}/LICENSE"
