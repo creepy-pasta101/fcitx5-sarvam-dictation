@@ -17,7 +17,7 @@ else:                                      /tmp/sarvam-dictation-<uid>.sock
 
 `<uid>` is the numeric real uid (`os.getuid()` in Python, `getuid()` in C++), written without padding. The C++ side reads `getenv("XDG_RUNTIME_DIR")` directly rather than going through fcitx5's `StandardPaths`, precisely so that the two processes cannot disagree about which directory the runtime socket belongs in.
 
-Either side may override the path: the daemon through `[server] socket_path` in its config or `--socket` on its command line, the addon through its `SocketPath` option. Both default to the rule above, so an override is only needed when you deliberately want a non-default location, and it must be set on both sides or they will not find each other.
+Either side may override the path, and both read the override from the same place: `[server] socket_path` in the daemon config file, or `--socket` on the daemon's command line. The addon takes `[server] socket_path` from `config.toml` too, so an override is set once rather than twice, and the two processes cannot end up looking in different places because one of them was missed. Both default to the rule above, so an override is only needed when you deliberately want a non-default location.
 
 ## Framing
 
@@ -33,20 +33,21 @@ Every message carries `"v": 1`. The value is present in both directions and on e
 
 ## Client to server
 
-Five commands. `id` is a client-generated UUIDv4 in hex form and is required on every command except `ping`.
+Six commands. `id` is a client-generated UUIDv4 in hex form and is required on every command except `ping`.
 
 ```json
 {"v":1,"cmd":"start","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
 {"v":1,"cmd":"stop","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
 {"v":1,"cmd":"toggle","id":"b41e7d2c9a3f40518c6b2e7d0f4a931c"}
 {"v":1,"cmd":"cancel","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873"}
+{"v":1,"cmd":"reload","id":"a6f4b2d80c9e41f7b3d5a1e6c8f02b94"}
 {"v":1,"cmd":"ping"}
 ```
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `v` | integer | yes | Protocol version, `1`. |
-| `cmd` | string | yes | One of `start`, `stop`, `toggle`, `cancel`, `ping`. |
+| `cmd` | string | yes | One of `start`, `stop`, `toggle`, `cancel`, `reload`, `ping`. |
 | `id` | string | all but `ping` | Client-chosen identifier for this command. Echoed on every message that results from the command. |
 
 `start` begins recording. If a recording is already in progress or a transcription is in flight, the reply is `error` with code `busy`.
@@ -57,11 +58,13 @@ Five commands. `id` is a client-generated UUIDv4 in hex form and is required on 
 
 `cancel` stops the current recording and discards it without transcribing and without deleting anything the caller needs. It is legal in any state; when nothing is recording it is a no-op that still produces the current `state`. During `transcribing` it does not abort the in-flight HTTP request — the daemon replies with the `idle` state when that request finishes.
 
+`reload` re-reads the daemon config file from disk and applies it to future recordings. It is legal in any state and is answered with `reloaded` or with an `error` carrying code `config_invalid`. It does not carry a config path: the daemon always reads the file it was started with, which is `~/.config/sarvam-dictation/config.toml` (or `$XDG_CONFIG_HOME/sarvam-dictation/config.toml`) unless `--config` said otherwise. The full semantics are in [Configuration reload](#configuration-reload).
+
 `ping` replies `{"v":1,"type":"pong"}` and carries no `id`. It exists so a client can check liveness without disturbing a recording, and it is what keeps the socket demonstrably responsive while transcription runs in a worker thread.
 
 ## Server to client
 
-Four message types.
+Five message types.
 
 ### `state`
 
@@ -98,6 +101,22 @@ An empty transcript is a legal, successful outcome — silence, a muted micropho
 
 `result` is delivered only to the owner of the recording (see below), never broadcast.
 
+### `reloaded`
+
+```json
+{"v":1,"type":"reloaded","id":"a6f4b2d80c9e41f7b3d5a1e6c8f02b94"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | integer | Protocol version, `1`. |
+| `type` | string | `reloaded`. |
+| `id` | string | The `id` of the `reload` command that this message answers. |
+
+`reloaded` says that the config file was read and applied. It is the acknowledgement of one `reload` command and carries nothing else: no copy of the settings, no summary of what changed. It is delivered to the connection that sent the `reload`, never broadcast, and it never accompanies a `state` message.
+
+A missing config file also produces `reloaded`, because falling back to the built-in defaults is a successful reload and is what the daemon does at startup too.
+
 ### `error`
 
 ```json
@@ -112,7 +131,7 @@ An empty transcript is a legal, successful outcome — silence, a muted micropho
 | `code` | string | One of the codes in the table below. Clients switch on this, not on the message text. |
 | `message` | string | Human-readable detail. May be shown to the user, so it must never contain the API key. |
 
-`error` is delivered only to the owner of the recording, except for `bad_request` errors caused by a line the daemon cannot attribute, which go back on the connection that sent the line.
+`error` is delivered only to the owner of the recording, except for `bad_request` errors caused by a line the daemon cannot attribute, which go back on the connection that sent the line, and for errors answering a command that is not tied to a recording — `reload`, whose `config_invalid` reply goes back to the connection that asked.
 
 ### `pong`
 
@@ -132,6 +151,8 @@ If the owner's connection closes while it owns a recording, the daemon cancels t
 
 The rule exists because a recording is a scarce, exclusive resource and its output belongs to whoever asked for it. Broadcasting results would type one person's dictation into another client's field; broadcasting nothing at all and letting any client stop any recording would let a stray connection silently destroy someone else's audio.
 
+`reload` is outside this rule: it belongs to no recording, so any connection may send it at any time, and its reply goes to the sender.
+
 ## State machine
 
 ```
@@ -143,7 +164,24 @@ transcribing --cancel--> (no effect on the in-flight request; reply state idle w
 
 There is one recording at a time. A `start` or `toggle`-that-starts arriving while the daemon is `recording` or `transcribing` produces `error` code `busy` and leaves the state unchanged. A `stop` arriving while `idle` produces `error` code `busy` as well.
 
+`reload` appears nowhere in that diagram on purpose: it is not a transition. It leaves `idle`, `recording` and `transcribing` exactly as they were.
+
 The daemon is a single asyncio loop. Transcription runs in a worker thread (`asyncio.to_thread`), so the loop keeps reading the socket throughout: `ping` is answered and `cancel` is accepted while the HTTP request is outstanding. Anything that would block the loop — reading audio, waiting on the network — happens off it.
+
+## Configuration reload
+
+`reload` is how a running daemon is told that its config file changed. The file itself is the only channel for settings; nothing about configuration is pushed over the socket.
+
+The rules, in full:
+
+* **Future operations only.** The daemon re-reads `~/.config/sarvam-dictation/config.toml` and applies the result to the next recording. A recording in progress, and a transcription already in flight, complete with the settings they started with. Nothing is retried or restarted.
+* **A missing file succeeds.** The daemon falls back to its built-in defaults, exactly as it does at startup, and answers `reloaded`.
+* **An invalid file fails without consequences.** If the file cannot be parsed or a value is out of range, the reply is `error` with code `config_invalid` and a `message` that names the offending key, for example `[api] mode 'dictate' is not one of transcribe, translate, verbatim, translit, codemix`. The daemon keeps running with the settings it already had and does **not** drop the socket: a bad config is a user mistake to be corrected, not a reason to break the client's connection.
+* **Legal in any state.** `idle`, `recording` and `transcribing` all accept `reload`. It never disturbs the state machine, never touches ownership, and never interrupts the current recording.
+* **Never broadcast.** No `state` message is emitted and no other connection is told that a reload happened. A reload is not a state change, and clients must not wait for one.
+* **`id` is required**, like every command but `ping`. Without it the reply is `bad_request`.
+
+The addon sends `reload` immediately after it writes `config.toml` from the fcitx5 configuration page, and once more right after a successful socket connect, so a daemon that was started long ago — by systemd, say — catches up with a file that changed while it was not connected.
 
 ## Error codes
 
@@ -151,6 +189,7 @@ The daemon is a single asyncio loop. Transcription runs in a worker thread (`asy
 |---|---|---|
 | `busy` | The command is not legal in the current state, or the recording belongs to someone else. | `start` while recording or transcribing; `stop` while idle; `stop` or `cancel` from a non-owner connection. |
 | `bad_request` | The line could not be understood. | Unparseable JSON, a JSON value that is not an object, an unknown `cmd`, or a missing `id` on a command that requires one. |
+| `config_invalid` | The config file could not be read as valid settings, so nothing was applied and the daemon kept its previous settings. | A `reload` after the file was hand-edited into something unparseable, or a value the daemon rejects: an unknown `[api] mode`, an unknown `[audio] backend`, an empty `[api] model`, a non-positive `[audio] sample_rate` or `[server] max_duration_s`. The `message` names the key. |
 | `no_api_key` | No API key is available, so no request was attempted. | Neither `[api] key` in the config file nor `SARVAM_API_KEY` in the environment is set. |
 | `no_audio_device` | No usable capture backend, or the configured device is unusable. | None of `pw-record`, `parec`, `arecord` on `PATH`; an `[audio] device` that does not exist. |
 | `audio_failed` | Capture started but produced nothing usable. | Zero-length or unreadable WAV; the capture process died before it was asked to stop; `stop` called when no recording is running. |
@@ -168,6 +207,8 @@ One client, one dictation, from an idle daemon. `C:` is the addon, `S:` is the d
 ```
 C: {"v":1,"cmd":"ping"}
 S: {"v":1,"type":"pong"}
+C: {"v":1,"cmd":"reload","id":"a6f4b2d80c9e41f7b3d5a1e6c8f02b94"}
+S: {"v":1,"type":"reloaded","id":"a6f4b2d80c9e41f7b3d5a1e6c8f02b94"}
 C: {"v":1,"cmd":"toggle","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
 S: {"v":1,"type":"state","state":"recording","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
 C: {"v":1,"cmd":"toggle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
@@ -176,9 +217,33 @@ S: {"v":1,"type":"result","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60","text":"नम
 S: {"v":1,"type":"state","state":"idle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
 ```
 
-The first `toggle` starts the recording and makes this connection its owner; the resulting `state` carries that command's `id`. The second `toggle` stops it, producing a `transcribing` state, then the `result`, then the `idle` state as the daemon returns to rest. The addon commits `text` to the input context it captured at the first press, appends a space, and closes the "Transcribing…" notification when the `idle` arrives.
+The `reload` right after the connect is the addon catching the daemon up with `config.toml`: the addon had read the file, and the daemon may have been running since before the last change. The answer is `reloaded`, with no `state` line in between, because a reload is not a transition. The first `toggle` then starts the recording and makes this connection its owner; the resulting `state` carries that command's `id`. The second `toggle` stops it, producing a `transcribing` state, then the `result`, then the `idle` state as the daemon returns to rest. The addon commits `text` to the input context it captured at the first press, appends a space, and closes the "Transcribing…" notification when the `idle` arrives.
 
-A failure looks like this instead — the recording ran, the key was missing:
+A reload can also arrive in the middle of a recording, which is what happens when the user presses *Apply* in the configuration page while dictating. Nothing about the recording changes:
+
+```
+C: {"v":1,"cmd":"toggle","id":"b41e7d2c9a3f40518c6b2e7d0f4a931c"}
+S: {"v":1,"type":"state","state":"recording","id":"b41e7d2c9a3f40518c6b2e7d0f4a931c"}
+C: {"v":1,"cmd":"reload","id":"c58a1f3b7d2e46098b4c6a1f3e7d205b"}
+S: {"v":1,"type":"reloaded","id":"c58a1f3b7d2e46098b4c6a1f3e7d205b"}
+C: {"v":1,"cmd":"toggle","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873"}
+S: {"v":1,"type":"state","state":"transcribing","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873"}
+S: {"v":1,"type":"result","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873","text":"अगली बैठक सोमवार को है।","language_code":"hi-IN","duration_ms":3120,"segments":1}
+S: {"v":1,"type":"state","state":"idle","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873"}
+```
+
+The `reloaded` in the middle is the only line the reload produces. The recording started with the old settings, so it is transcribed with them; the settings written by that *Apply* take effect from the next recording.
+
+A reload of a file the daemon cannot accept answers with an error and changes nothing:
+
+```
+C: {"v":1,"cmd":"reload","id":"9b7c2e4a1f6d43058c2b9e7a4d1f6308"}
+S: {"v":1,"type":"error","id":"9b7c2e4a1f6d43058c2b9e7a4d1f6308","code":"config_invalid","message":"[api] mode 'dictate' is not one of transcribe, translate, verbatim, translit, codemix"}
+```
+
+The connection stays open and the daemon keeps transcribing with the settings it had.
+
+A failure during dictation looks like this instead — the recording ran, the key was missing:
 
 ```
 C: {"v":1,"cmd":"toggle","id":"b41e7d2c9a3f40518c6b2e7d0f4a931c"}
@@ -189,4 +254,4 @@ S: {"v":1,"type":"error","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873","code":"no_api_
 S: {"v":1,"type":"state","state":"idle","id":"e09b3c5a1d7f42e8b6a4c9d2f0e1b873"}
 ```
 
-A second connection watching the same daemon sees both `state` lines and neither the `result` nor the `error`. If it tries `{"v":1,"cmd":"stop","id":"5d3e8f1a7c2b49068e1f3a5c7d9b2e40"}` while the first connection owns the recording, it receives `{"v":1,"type":"error","id":"5d3e8f1a7c2b49068e1f3a5c7d9b2e40","code":"busy","message":"another client owns the recording"}`, and the first connection's recording continues undisturbed.
+A second connection watching the same daemon sees both `state` lines and neither the `result` nor the `error`. If it tries `{"v":1,"cmd":"stop","id":"5d3e8f1a7c2b49068e1f3a5c7d9b2e40"}` while the first connection owns the recording, it receives `{"v":1,"type":"error","id":"5d3e8f1a7c2b49068e1f3a5c7d9b2e40","code":"busy","message":"another client owns the recording"}`, and the first connection's recording continues undisturbed. If that second connection sends `reload` instead, it is answered with `reloaded` — and the first connection sees nothing at all.
