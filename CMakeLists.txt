@@ -70,6 +70,18 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}")
 
     add_test(NAME tomlfile COMMAND tomlfile_test)
+
+    # The notify-send helper is fcitx5-free too, so it is tested the same way:
+    # the argument vector it builds and its PATH lookup, without a desktop.
+    add_executable(desktopnotify_test
+        tests/cpp/test_desktopnotify.cpp
+        src/desktopnotify.cpp)
+
+    target_include_directories(desktopnotify_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
+
+    add_test(NAME desktopnotify COMMAND desktopnotify_test)
 endif()
 
 # Daemon-side install rules plus the CPack configuration (TGZ and RPM). Included

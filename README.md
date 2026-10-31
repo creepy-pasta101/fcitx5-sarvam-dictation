@@ -1,6 +1,6 @@
 # fcitx5-sarvam-dictation
 
-A dictation input method for Linux desktops. Press a hotkey anywhere — in a browser, a terminal, a chat window, an editor — speak in any of the 22 Indian languages Sarvam AI supports (or in English), press the hotkey again, and the transcript is typed into whatever field currently has focus. There is no separate dictation window and no copy-paste step: the text arrives as if you had typed it. The project is two pieces that work together: a small C++ addon for **Fcitx 5**, the input method framework, which owns the hotkey, the desktop notifications and the text insertion, and a Python daemon that owns audio capture and calls **Sarvam AI's Saaras speech-to-text model** over HTTPS. The addon never speaks HTTP and the daemon never touches fcitx5.
+A dictation input method for Linux desktops. Press a hotkey anywhere — in a browser, a terminal, a chat window, an editor — speak in any of the 22 Indian languages Sarvam AI supports (or in English), press the hotkey again to stop, and the transcript is typed into whatever field currently has focus. If you would rather not press twice, a second hotkey works as push-to-talk: hold it down for as long as you speak and the release ends the recording. There is no separate dictation window and no copy-paste step: the text arrives as if you had typed it. The project is two pieces that work together: a small C++ addon for **Fcitx 5**, the input method framework, which owns the hotkey, the desktop notifications and the text insertion, and a Python daemon that owns audio capture and calls **Sarvam AI's Saaras speech-to-text model** over HTTPS. The addon never speaks HTTP and the daemon never touches fcitx5.
 
 ## How it works
 
@@ -110,7 +110,7 @@ Every setting is edited in `fcitx5-configtool`, on the **Sarvam Dictation** addo
 The page writes two files, because the two processes own different things:
 
 * `~/.config/sarvam-dictation/config.toml` (or `$XDG_CONFIG_HOME/sarvam-dictation/config.toml` when that variable is set) holds the API, audio and server settings — everything the daemon reads. This file holds your API key and is written with mode `0600`, so only you can read it.
-* `~/.config/fcitx5/conf/sarvamdictation.conf` holds the addon-only settings: the trigger key, the daemon command, the notification tips and the trailing space. The daemon has no interest in any of these, so they never enter `config.toml`.
+* `~/.config/fcitx5/conf/sarvamdictation.conf` holds the addon-only settings: the trigger key, the push-to-talk key, the daemon command, the two notification options and the trailing space. The daemon has no interest in any of these, so they never enter `config.toml`.
 
 When you press *Apply*, the addon writes `config.toml` from the values on the page, then sends a `reload` command to the daemon over the socket. A running daemon re-reads the file and applies the new settings to the next recording — no restart of either process is needed.
 
@@ -138,9 +138,11 @@ These live in `~/.config/fcitx5/conf/sarvamdictation.conf` and are shown on the 
 | Setting | Default | Meaning |
 |---|---|---|
 | Trigger key | `Control+Alt+d` | Key combination that starts and stops dictation. Several combinations may be bound. |
+| Push-to-talk key | `Control+Alt+space` | Key combination held down to record; releasing it stops and transcribes. Several combinations may be bound. |
 | Start the daemon automatically | `true` | Start the daemon command when the daemon cannot be reached. |
 | Daemon command | `sarvam-dictation-daemon` | Program the addon launches when autostarting. |
-| Show notification tips | `true` | Show "Listening…" and "Transcribing…" notification tips. |
+| Notify on errors | `true` | Deliver a failure as a desktop notification through `notify-send`, with an fcitx5 tip as the fallback. |
+| Show a tip while recording | `false` | Show "Listening…" and "Transcribing…" tips while dictating. Off by default, so nothing is shown while you dictate unless you turn it on. |
 | Append a trailing space | `true` | Append a space after the committed transcript, so consecutive dictations do not run together. |
 
 The socket path used to be an addon setting; it is now `[server] socket_path` in `config.toml`. Both processes read it from there, so there is only one place to set it and the two sides cannot disagree.
@@ -192,7 +194,15 @@ The key can also come from the `SARVAM_API_KEY` environment variable, which fill
 
 ## Usage
 
-Press `Control+Alt+d` (or whatever you bound to the trigger key). A notification appears saying *Listening…* and the daemon starts recording from your default source. Press the same hotkey again: the notification changes to *Transcribing…*, the recording is finalised and sent to Sarvam, and when the answer comes back the text is committed into the field that had focus when you first pressed the hotkey, followed by a space if *Append a trailing space* is on. The notification closes when the daemon returns to idle.
+There are two ways to dictate, and they use two different keys.
+
+The toggle key starts and stops. Press `Control+Alt+d` (or whatever you bound to the trigger key) and the daemon starts recording from your default source; press the same hotkey again and the recording is finalised and sent to Sarvam. This is the mode to use for a long thought, because you do not have to keep a finger on the keyboard.
+
+The push-to-talk key records while it is held. Press `Control+Alt+space` (or whatever you bound to the push-to-talk key), keep it down and speak; release it and the recording ends and is transcribed. Nothing has to be pressed twice: the release of the key is what stops the recording, so the length of the hold is the length of the clip. A hold has to last at least 250 ms. A shorter tap is discarded rather than uploaded — the recording is cancelled, nothing is transcribed and nothing is committed — so a mistyped key combination cannot paste a fraction of a second of silence into your document. Losing window focus also ends a push-to-talk recording: if you switch windows while holding the key, the key-up goes to the other window, so the addon finishes the recording itself instead of leaving the microphone open.
+
+Either way, the recording is sent to Sarvam, and when the answer comes back the text is committed into the field that had focus when you started, followed by a space if *Append a trailing space* is on.
+
+By default nothing is shown on screen while you dictate. There is no *Listening…* tip and no *Transcribing…* tip: the addon is silent from the moment you start recording until the transcript appears. Turn on *Show a tip while recording* if you want those tips back. Failures are the exception and are never silent: when the daemon cannot be reached, when the API rejects the key, or when the recording produced no audio, you get a desktop notification delivered by `notify-send`, so the message is seen even when the fcitx5 notification daemon is not running. `notify-send` comes from the `libnotify-bin` package on Debian and Ubuntu, or from `libnotify` on Fedora and openSUSE; if it is not installed, the addon falls back to an fcitx5 notification tip instead. Errors are reported regardless of *Show a tip while recording*, and turning off *Notify on errors* leaves them in the log only.
 
 The output mode chooses what Saaras does with your speech. `transcribe` is the everyday choice: speech in, text in the same language's own script. `translate` returns the transcript in English, which is useful when you speak an Indian language but need English text. `verbatim` keeps the disfluencies and false starts rather than tidying them away, which is what you want for interview or meeting notes where the exact wording matters. `translit` returns romanised text instead of native script, useful for names, addresses and anything you will read back over a phone line. `codemix` is for speech that mixes languages inside a sentence, such as Hindi with English technical words, and preserves that mixture instead of forcing one language. Leave the language on *Auto-detect* to let the service detect it; set a code (for example `hi-IN`) when you know it, since detection on a short utterance is the most common source of a wrong-language transcript.
 
@@ -221,7 +231,8 @@ The helper speaks the same protocol as the addon and has one command per client 
 | Settings on the page revert after you edit the file by hand | The page is filled from `config.toml` when fcitx5 loads the addon, and *Apply* rewrites the keys it manages. Make the change on the page, or reload fcitx5 before pressing *Apply*. |
 | Empty transcript, nothing inserted | The daemon transcribed silence or noise and returned an empty string, which is a legal result and commits nothing. Check the microphone is not muted and that the audio device points at it; raise your input level and try a longer utterance. |
 | Text is transcribed but does not appear in the application | The application may not be using fcitx5 at all. Electron and some GTK applications only get text committed through fcitx5's own frontend: make sure the app is running under Wayland with `GTK_IM_MODULE=fcitx`/`QT_IM_MODULE=fcitx`, or under X11 with `XMODIFIERS=@im=fcitx`, and that fcitx5's Wayland or X11 frontend is the one the app connects to. Also check whether the window that had focus was closed while transcribing — the text then goes to the most recent input context, which may be a different window. |
-| Hotkey does nothing, or does the wrong thing | Another binding owns `Control+Alt+d`. Change the trigger key in the addon's configuration page, or free the key in your desktop's keyboard settings. Bindings grabbed by the compositor never reach fcitx5. |
+| Hotkey does nothing, or does the wrong thing | Another binding owns `Control+Alt+d` or `Control+Alt+space`. Change the trigger key or the push-to-talk key in the addon's configuration page, or free the key in your desktop's keyboard settings. Bindings grabbed by the compositor never reach fcitx5. |
+| A short push-to-talk tap records nothing | A hold shorter than 250 ms is treated as an accidental tap and the recording is cancelled, so nothing is transcribed. Hold the key for longer. Losing window focus during the hold also ends the recording early. |
 | Need to see what happened | Daemon logs go to the journal when it runs as a service: `journalctl --user -u sarvam-dictation -f`. For a foreground daemon, raise the level with `sarvam-dictation-daemon --log-level debug`. For the addon, restart fcitx5 in verbose mode with `fcitx5 -rd --verbose`. |
 
 `sarvam-dictation-daemon --check` is the single most useful diagnostic: it validates the config file, reports the resolved audio backend and device, says whether an API key is present, and exits non-zero if something is wrong.
