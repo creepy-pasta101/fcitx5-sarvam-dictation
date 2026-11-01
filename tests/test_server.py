@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import socket as socket_module
 import stat
@@ -41,8 +42,10 @@ from pathlib import Path
 import pytest
 
 import sarvam_dictation.server as server_module
+import sarvam_dictation.streaming as streaming_module
 from sarvam_dictation.config import Config, load_config
 from sarvam_dictation.server import PARTIAL_INTERVAL, DictationServer
+from sarvam_dictation.streaming import RealtimeTranscriber
 
 READ_TIMEOUT = 2.0
 QUIET_WINDOW = 0.15
@@ -2007,3 +2010,256 @@ def test_a_config_file_with_only_streaming_toggle_streams_toggle_only(
     assert kit.recorder_factory.calls == 1
     assert kit.recorder.start_calls == 1
     assert kit.transcriber.finish_calls == 1
+
+
+# --------------------------------------------------------------------------
+# settling the transcript, and the drain that feeds audio (brief 16)
+# --------------------------------------------------------------------------
+
+
+class SlowFeedTranscriber(FakeStreamingTranscriber):
+    """A transcriber whose ``feed`` takes real time, like a slow upload.
+
+    ``gate`` blocks every feed until the test opens it, which is how a drain
+    that has not finished can be observed without waiting for seconds.
+    """
+
+    def __init__(self, per_feed=0.03, gate=None, **kwargs):
+        super().__init__(**kwargs)
+        self.per_feed = per_feed
+        self.gate = gate
+        self.feeds_started = 0
+
+    async def feed(self, pcm):
+        self.feeds_started += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        else:
+            await asyncio.sleep(self.per_feed)
+        await super().feed(pcm)
+
+
+class _Pause:
+    """A scripted wait between two realtime messages."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+
+class ScriptedRealtimeSocket:
+    """The socket the *real* ``RealtimeTranscriber`` talks to.
+
+    ``recv()`` replays a script of messages separated by :class:`_Pause`
+    entries and then blocks, exactly as a live session that has finished
+    speaking but not yet closed looks. Every message handed over is recorded
+    with whether the session had already been closed, so a test can prove the
+    session stayed open past the first final.
+    """
+
+    def __init__(self, script=()):
+        self._script = list(script)
+        self._block = asyncio.Event()
+        self.sent = []
+        self.received = []
+        self.closed_when = []
+        self.closed = False
+
+    async def recv(self):
+        while self._script:
+            item = self._script.pop(0)
+            if isinstance(item, _Pause):
+                await asyncio.sleep(item.seconds)
+                continue
+            self.received.append(item)
+            self.closed_when.append(self.closed)
+            return item
+        await self._block.wait()
+        raise ConnectionResetError("the session is over")
+
+    async def _record(self, message):
+        self.sent.append(message.dict() if hasattr(message, "dict") else dict(message))
+
+    async def send_realtime_audio_input(self, message):
+        await self._record(message)
+
+    async def send_realtime_speech_start(self, message):
+        await self._record(message)
+
+    async def send_realtime_speech_end(self, message):
+        await self._record(message)
+
+    async def send_realtime_flush(self, message):
+        await self._record(message)
+
+    async def send_realtime_end(self, message):
+        await self._record(message)
+
+    async def send_realtime_ping(self, message):
+        await self._record(message)
+
+
+class ScriptedRealtimeContext:
+    """The async context manager ``connect()`` returns."""
+
+    def __init__(self, socket):
+        self._socket = socket
+
+    async def __aenter__(self):
+        return self._socket
+
+    async def __aexit__(self, *exc_info):
+        self._socket.closed = True
+        return False
+
+
+class ScriptedRealtimeClient:
+    """A ``sarvamai`` client stand-in that serves one scripted socket."""
+
+    def __init__(self, socket):
+        self.socket = socket
+        self.connect_calls = []
+        self.speech_to_text_realtime_streaming = self
+
+    def connect(self, **kwargs):
+        self.connect_calls.append(kwargs)
+        return ScriptedRealtimeContext(self.socket)
+
+
+def test_the_streaming_drain_gets_its_own_larger_bound():
+    # A client-socket write may be given up on quickly; the drain that feeds
+    # captured audio into the socket may not, because cancelling it destroys
+    # speech rather than merely delaying a result.
+    assert server_module.DRAIN_TIMEOUT == pytest.approx(5.0)
+    assert server_module.STREAM_DRAIN_TIMEOUT == pytest.approx(60.0)
+    assert server_module.STREAM_DRAIN_TIMEOUT > server_module.DRAIN_TIMEOUT
+
+
+def test_a_slow_feed_no_longer_loses_audio_at_stop_time(
+    tmp_path, streaming_config, monkeypatch
+):
+    # The drain is slower than the client-write bound, which is the bound the
+    # old code cancelled it on: every captured chunk must still reach the
+    # socket, because they are speech.
+    monkeypatch.setattr(server_module, "DRAIN_TIMEOUT", 0.05)
+    sock = tmp_path / "dictation.sock"
+    chunks = [bytes([index]) * 320 for index in range(5)]
+    kit = StreamKit(
+        recorder=FakeStreamingRecorder(chunks=chunks),
+        transcriber=SlowFeedTranscriber(per_feed=0.03, text="पाँच खंड", segments=5),
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "d1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "d2"})
+            result = await client.read_until(is_type("result"))
+            assert result["text"] == "पाँच खंड"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.transcriber.fed == chunks, "a slow drain must not lose captured audio"
+    assert kit.transcriber.finish_calls == 1
+
+
+def test_a_drain_that_outlives_its_bound_is_logged_and_never_cancelled(
+    tmp_path, streaming_config, monkeypatch, caplog
+):
+    monkeypatch.setattr(server_module, "STREAM_DRAIN_TIMEOUT", 0.05)
+    sock = tmp_path / "dictation.sock"
+    chunks = [bytes([index]) * 320 for index in range(3)]
+    kit = StreamKit(
+        recorder=FakeStreamingRecorder(chunks=chunks),
+        transcriber=SlowFeedTranscriber(text="देर से", segments=1),
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        gate = asyncio.Event()
+        kit.transcriber.gate = gate
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "t1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "t2"})
+            # The drain is stuck, so the bound expires: the recording still
+            # finishes, because the audio that did arrive is worth transcribing.
+            result = await client.read_until(is_type("result"))
+            assert result["text"] == "देर से"
+            await client.read_until(is_state("idle"))
+            # Opening the gate proves the task was left running, not cancelled:
+            # the captured chunks still reach the transcriber afterwards.
+            gate.set()
+            await asyncio.sleep(0.05)
+            assert kit.transcriber.fed == chunks
+            await client.close()
+
+    with caplog.at_level(logging.WARNING, logger="sarvam_dictation.server"):
+        asyncio.run(scenario())
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any("streaming drain did not finish" in message for message in warnings), warnings
+    assert any("may be missing" in message for message in warnings), warnings
+
+
+def test_a_final_then_more_after_a_pause_all_reach_the_result(
+    tmp_path, streaming_config, monkeypatch
+):
+    # The regression that matters, driven through the whole server with the
+    # real RealtimeTranscriber: the service finalises one segment, pauses while
+    # it works through the backlog, then finalises two more. All three must be
+    # in the ``result``, and the session must not be closed after the first.
+    monkeypatch.setattr(streaming_module, "FINAL_SETTLE_S", 0.3)
+    monkeypatch.setattr(streaming_module, "FINAL_DEADLINE_S", 5.0)
+    sock = tmp_path / "dictation.sock"
+    socket = ScriptedRealtimeSocket(
+        [
+            {"event": "transcript.final", "utterance_idx": 0, "text": "पहला"},
+            _Pause(0.04),
+            {"event": "transcript.final", "utterance_idx": 1, "text": "दूसरा"},
+            _Pause(0.04),
+            {"event": "transcript.final", "utterance_idx": 2, "text": "तीसरा"},
+        ]
+    )
+    recorder = FakeStreamingRecorder()
+
+    def transcriber_factory(on_partial):
+        return RealtimeTranscriber(
+            streaming_config,
+            on_partial=on_partial,
+            client=ScriptedRealtimeClient(socket),
+        )
+
+    server = DictationServer(
+        streaming_config,
+        stream_recorder_factory=lambda: recorder,
+        stream_transcriber_factory=transcriber_factory,
+        socket_path=str(sock),
+    )
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "m1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "m2"})
+            result = await client.read_until(is_type("result"))
+            await client.read_until(is_state("idle"))
+            await client.close()
+            return result
+
+    result = asyncio.run(scenario())
+    assert result["text"] == "पहला दूसरा तीसरा"
+    assert result["segments"] == 3
+    assert len(socket.received) == 3
+    assert socket.closed_when == [False, False, False], (
+        "the realtime session must stay open past the first final"
+    )
+    assert socket.closed is True
