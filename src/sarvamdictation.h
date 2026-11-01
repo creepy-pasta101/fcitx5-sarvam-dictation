@@ -140,8 +140,21 @@ private:
     /// Always returns false, because the source is one-shot.
     bool onPartialTimer();
     /// Drop the pending partial, disarm the timer and forget what was shown,
-    /// so the next recording never starts from a stale tail.
+    /// so the next recording never starts from a stale tail. Any composition
+    /// text this recording put in the field goes with it.
     void clearPartialDisplay();
+
+    /// Show `text` as composition text in the focused field. Uses client-side
+    /// preedit when the client supports it and fcitx5's own panel otherwise.
+    /// Does nothing at all when there is no tracked context, or it is not
+    /// focused: composing into a window the user is not looking at would put
+    /// the words in the wrong field.
+    void setPreeditText(const std::string &text);
+
+    /// Clear any composition text. Idempotent, and safe to call with no focused
+    /// context. Must be called before committing a final transcript, or the
+    /// client ends up with the composition and the commit both.
+    void clearPreedit();
     void reportUnreachable();
     void spawnDaemon();
 
@@ -221,6 +234,11 @@ private:
     // source reports after it has fired depends on the event-loop backend
     // fcitx5 was built with.
     bool partialTimerArmed_ = false;
+    // True between setPreeditText() putting a composition in the focused field
+    // and clearPreedit() taking it away. Tracked so clearPreedit() can be
+    // called from every exit path, and twice in a row, without sending an
+    // empty preedit to a client that never had one.
+    bool preeditActive_ = false;
 
     std::string readBuffer_;
     std::string writeBuffer_;

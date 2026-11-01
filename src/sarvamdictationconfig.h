@@ -253,6 +253,12 @@ FCITX_CONFIGURATION(
     // Transcribing) while turning the text itself off.
     Option<bool> showPartialText{
         this, "ShowPartialText", _("Show the transcript in the indicator"), true};
+    // Streams the partial transcript into the focused field as IME preedit, so
+    // the words appear where they will be typed and are replaced by the final
+    // transcript. With this on, the indicator shows only the state.
+    Option<bool> preeditPartials{
+        this, "PreeditPartials",
+        _("Show the transcript in the text field while streaming"), true};
     // On by default: on KDE Plasma the recording indicator is Plasma's own OSD,
     // which needs no configuration and is invisible on every other desktop.
     Option<bool> showOsd{

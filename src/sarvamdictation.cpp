@@ -52,7 +52,10 @@
 #include "fcitx/addonmanager.h"
 #include "fcitx/event.h"
 #include "fcitx/inputcontext.h"
+#include "fcitx/inputpanel.h"
 #include "fcitx/instance.h"
+#include "fcitx/text.h"
+#include "fcitx/userinterface.h"
 
 #include "clipboard.h"
 #include "desktopnotify.h"
@@ -671,6 +674,10 @@ SarvamDictation::SarvamDictation(Instance *instance) : instance_(instance) {
     eventHandlers_.emplace_back(instance_->watchEvent(
         EventType::InputContextFocusOut, EventWatcherPhase::PreInputMethod,
         [this](Event &) {
+            // The composition text lives in the window that had focus, so it
+            // goes before anything else: left behind, it would strand a
+            // composition in a field nobody is looking at any more.
+            clearPreedit();
             if (pushToTalkActive_) {
                 FCITX_SARVAMDICTATION_DEBUG()
                     << "focus lost during push-to-talk, ending the recording";
@@ -735,6 +742,9 @@ void SarvamDictation::reloadConfig() {
 }
 
 void SarvamDictation::setConfig(const RawConfig &config) {
+    // Read before the load, because switching the new option off has to take
+    // the composition that is already in the field away now.
+    const bool preeditPartialsBefore = config_.preeditPartials.value();
     config_.load(config, true);
 
     // The API key field is write-only. Unchanged sentinel: put the stored
@@ -753,7 +763,16 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     // the text that is already on screen away now, rather than leaving it
     // there until the recording ends. The state messages are untouched: they
     // travel through showRecordingIndicator(), not through the partial path.
-    if (!config_.showPartialText.value()) {
+    // With PreeditPartials on the text lives in the client's field rather than
+    // in the indicator, so the switch that owns the visible text is the one
+    // that clears it -- and turning PreeditPartials itself off has to clear the
+    // composition too, because nothing else would do it until the recording
+    // ends, which would leave the field in composition.
+    const bool preeditJustDisabled =
+        preeditPartialsBefore && !config_.preeditPartials.value();
+    const bool textOff =
+        !config_.showPartialText.value() && !config_.preeditPartials.value();
+    if (preeditJustDisabled || textOff) {
         clearPartialDisplay();
     }
 
@@ -775,6 +794,9 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     addonOnly.setValueByPath(
         "ShowPartialText",
         config_.showPartialText.value() ? "True" : "False");
+    addonOnly.setValueByPath(
+        "PreeditPartials",
+        config_.preeditPartials.value() ? "True" : "False");
     addonOnly.setValueByPath("AppendSpace",
                              config_.appendSpace.value() ? "True" : "False");
     safeSaveAsIni(addonOnly, "conf/sarvamdictation.conf");
@@ -1176,21 +1198,28 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "partial") {
-        if (!config_.showPartialText.value()) {
-            // The user asked for state feedback without the text. Nothing is
-            // stored and no timer is armed, so a partial costs nothing at all.
+        // Either destination alone is reason enough to keep the text: the
+        // composition in the field, or the text on the indicator.
+        const bool preedit = config_.preeditPartials.value();
+        if (!preedit && !config_.showPartialText.value()) {
+            // The user asked for state feedback without the text, in the field
+            // and in the indicator alike. Nothing is stored and no timer is
+            // armed, so a partial costs nothing at all.
             return;
         }
         // A live partial transcript of the recording in progress. It is not
         // shown here: it arrives about ten times a second, every indicator
         // update forks a D-Bus client, and Plasma restarts the OSD's fade-in
         // on each call, so showing each one makes the indicator flash. The
-        // text is sanitised, capped to its newest words and kept in
-        // pendingPartial_, and the trailing-edge timer shows it at most about
-        // three times a second with the newest text always landing. This path
-        // builds no notification and logs nothing.
-        const std::string text =
-            capPartialTail(sanitisePartialText(message.text));
+        // text is sanitised and kept in pendingPartial_, and the trailing-edge
+        // timer shows it at most about three times a second with the newest
+        // text always landing. This path builds no notification and logs
+        // nothing.
+        //
+        // The text is kept whole, not tail-capped: the field is the real
+        // destination, and a tail that starts with "..." would be wrong there,
+        // so the cap is applied in onPartialTimer(), on the indicator copy.
+        const std::string text = sanitisePartialText(message.text);
         if (text.empty()) {
             // Nothing but whitespace or control characters. Show nothing, and
             // leave lastShownPartial_ untouched so a later identical redraw is
@@ -1217,7 +1246,9 @@ void SarvamDictation::handleLine(std::string_view line) {
         lastState_ = message.state;
         // Whatever partial was on screen described the recording that just
         // ended, so the next one starts from a clean slate: the pending text,
-        // the timer and the remembered text all go.
+        // the timer, the remembered text and any composition in the field all
+        // go. This runs for every state, so "idle" leaves no composition
+        // behind either.
         clearPartialDisplay();
         if (message.state == "recording") {
             showRecordingIndicator(kAppIcon, _("Listening"),
@@ -1257,6 +1288,10 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "error") {
+        // The recording this error belongs to is over, and nothing further of
+        // it will arrive to clear a composition: the pending partial goes too,
+        // so the trailing-edge timer cannot compose it after the error.
+        clearPartialDisplay();
         if (!message.id.empty()) {
             auto iter =
                 std::find(pendingIds_.begin(), pendingIds_.end(), message.id);
@@ -1428,12 +1463,24 @@ bool SarvamDictation::onPartialTimer() {
     // Remember the text before showing it, so an identical partial that
     // arrives afterwards costs nothing.
     lastShownPartial_ = pendingPartial_;
-    showRecordingIndicator(kAppIcon, lastShownPartial_,
+    if (config_.preeditPartials.value()) {
+        // The field already has the words, so the indicator keeps the state
+        // text it last showed and is not touched here at all: every indicator
+        // update forks a D-Bus client, and there is nothing new to say.
+        setPreeditText(lastShownPartial_);
+        return false;
+    }
+    // The indicator is one line, so it gets the newest words only.
+    showRecordingIndicator(kAppIcon, capPartialTail(lastShownPartial_),
                            _("Release the key to finish."));
     return false;
 }
 
 void SarvamDictation::clearPartialDisplay() {
+    // The composition goes first: this is the path every end of a recording
+    // runs through, and a composition left behind would leave the user's field
+    // stuck in composition, which is the worst failure this addon could have.
+    clearPreedit();
     pendingPartial_.clear();
     lastShownPartial_.clear();
     partialTimerArmed_ = false;
@@ -1442,7 +1489,73 @@ void SarvamDictation::clearPartialDisplay() {
     }
 }
 
+void SarvamDictation::setPreeditText(const std::string &text) {
+    InputContext *inputContext = targetInputContext_.get();
+    if (!inputContext || !inputContext->hasFocus()) {
+        // No focused field to compose into. Writing the preedit anyway would
+        // put the words in a window the user is not looking at.
+        return;
+    }
+
+    // The two branches are not decoration. InputContext::updatePreedit()
+    // returns immediately when the client lacks CapabilityFlag::Preedit, so a
+    // client without preedit support only ever shows the text through
+    // setPreedit() plus updateUserInterface(InputPanel), which draws fcitx5's
+    // own composing window.
+    const bool useClientPreedit =
+        inputContext->capabilityFlags().test(CapabilityFlag::Preedit);
+
+    Text preedit;
+    if (!text.empty()) {
+        preedit.append(text, useClientPreedit ? TextFormatFlag::HighLight
+                                              : TextFormatFlag::NoFlag);
+    }
+    if (useClientPreedit) {
+        preedit.setCursor(0);
+        inputContext->inputPanel().setClientPreedit(preedit);
+    } else {
+        preedit.setCursor(static_cast<int>(text.size()));
+        inputContext->inputPanel().setPreedit(preedit);
+    }
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+    preeditActive_ = true;
+}
+
+void SarvamDictation::clearPreedit() {
+    if (!preeditActive_) {
+        // Nothing of ours is composed, so there is nothing to take away. This
+        // is what makes the call safe on every exit path and safe twice in a
+        // row: an empty preedit sent to a client that never had one would only
+        // be a spurious input-panel update.
+        return;
+    }
+    preeditActive_ = false;
+    // The words are no longer in the field, so the next partial that carries
+    // the same text has to be composed again instead of being suppressed as a
+    // duplicate of what is on screen.
+    lastShownPartial_.clear();
+
+    InputContext *inputContext = targetInputContext_.get();
+    if (!inputContext) {
+        // The window is gone and the composition went with it. Nothing left to
+        // tell: there is no panel to clear and no client to notify.
+        return;
+    }
+    // Clearing is the same call with an empty Text in both slots, followed by
+    // both updates, and it is done whether or not the context still has focus:
+    // the focus-out watcher runs precisely when it may not.
+    inputContext->inputPanel().setClientPreedit(Text());
+    inputContext->inputPanel().setPreedit(Text());
+    inputContext->updatePreedit();
+    inputContext->updateUserInterface(UserInterfaceComponent::InputPanel);
+}
+
 void SarvamDictation::reportUnreachable() {
+    // The daemon is gone, so no message will ever arrive to clear a composition
+    // this recording put in the field, and the pending partial would be
+    // composed again by the trailing-edge timer a moment from now.
+    clearPartialDisplay();
     pendingLines_.clear();
     pendingIds_.clear();
     retriesLeft_ = 0;
