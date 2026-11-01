@@ -499,9 +499,14 @@ class StreamingRecorder:
     stdout** - exactly the ``linear16`` format the realtime endpoint wants, so
     there is no header to parse and no normalisation step:
 
-    * ``pw-record --format s16 --rate R --channels 1 -``
+    * ``pw-record --format s16 --rate R --channels 1 --raw -``
     * ``parec --format=s16le --rate=R --channels=1 --raw``
     * ``arecord -f S16_LE -r R -c 1 -t raw``
+
+    Each backend is asked for its raw flag: pw-cat treats stdout as a
+    libsndfile destination, and ``format_from_filename`` defaults that to the
+    ``au`` container when no container is named, so ``--raw`` is what makes
+    pw-record write bare samples instead of a Sun/NeXT AU file with a header.
 
     The graceful shutdown ladder is the one the file-based recorder uses:
     SIGINT, then SIGTERM, then SIGKILL. ``stop()`` is safe when ``start()`` was
@@ -710,7 +715,17 @@ def _stream_command(backend: str, config: Config) -> list[str]:
     rate = str(config.sample_rate)
     device = config.audio_device
     if backend == "pipewire":
-        argv = ["pw-record", "--rate", rate, "--channels", "1", "--format", "s16"]
+        # ``--raw`` is not optional here. In pw-cat.c ``data.rawfile`` is false
+        # unless the flag is given, so the tool takes the libsndfile path
+        # (``setup_sndfile``) instead of ``setup_raw``; ``format_from_filename``
+        # then defaults the container for stdout to "au". A pw-record invocation
+        # that ends in "-" and lacks the flag therefore writes a Sun/NeXT AU
+        # container to stdout - a header followed by that container's sample
+        # layout - and the endpoint receives a header blob instead of bare
+        # little-endian PCM.
+        argv = [
+            "pw-record", "--rate", rate, "--channels", "1", "--format", "s16", "--raw"
+        ]
         if device:
             argv += ["--target", device]
         argv.append("-")

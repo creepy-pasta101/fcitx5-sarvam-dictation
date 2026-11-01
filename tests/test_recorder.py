@@ -529,6 +529,105 @@ def test_stream_command_rejects_an_unknown_backend(config):
     assert excinfo.value.code == "no_audio_device"
 
 
+# -- the raw flags ---------------------------------------------------------
+#
+# pw-cat only writes bare samples when ``data.rawfile`` is set, which is what
+# ``--raw`` does; without it the tool takes the libsndfile path and
+# ``format_from_filename`` defaults the container for stdout to ``au``, so
+# A pw-record invocation ending in "-" emits a Sun/NeXT AU container, header and all. These
+# tests pin the flag on the streaming path and pin it *off* the file path.
+
+
+def test_stream_command_pipewire_asks_for_raw_pcm(config):
+    """The streaming pw-record argv must carry ``--raw`` before the trailing ``-``."""
+    argv = recorder_mod._stream_command("pipewire", config)
+    assert argv[0] == "pw-record"
+    assert "--raw" in argv
+    assert argv.index("--raw") < argv.index("-")
+    assert argv[-1] == "-"
+    assert argv == [
+        "pw-record",
+        "--rate",
+        "16000",
+        "--channels",
+        "1",
+        "--format",
+        "s16",
+        "--raw",
+        "-",
+    ]
+
+
+def test_stream_command_pipewire_with_a_device_keeps_raw_and_target(make_config):
+    """A configured device must not displace ``--raw`` or the trailing ``-``."""
+    config = make_config(audio_device="alsa_input.usb")
+    argv = recorder_mod._stream_command("pipewire", config)
+    assert "--raw" in argv
+    assert argv[argv.index("--target") + 1] == "alsa_input.usb"
+    assert argv.index("--raw") < argv.index("--target") < argv.index("-")
+    assert argv[-1] == "-"
+    assert argv == [
+        "pw-record",
+        "--rate",
+        "16000",
+        "--channels",
+        "1",
+        "--format",
+        "s16",
+        "--raw",
+        "--target",
+        "alsa_input.usb",
+        "-",
+    ]
+
+
+def test_stream_command_pulse_and_alsa_keep_their_raw_flags(config):
+    """parec and arecord already asked for raw PCM; a refactor must not drop it."""
+    pulse = recorder_mod._stream_command("pulse", config)
+    assert "--raw" in pulse
+    alsa = recorder_mod._stream_command("alsa", config)
+    assert alsa[alsa.index("-t") + 1] == "raw"
+
+
+def test_streaming_start_spawns_pw_record_with_raw(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    """The argv actually handed to the subprocess carries ``--raw``."""
+    stream_popen()
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        await recorder.cancel()
+
+    asyncio.run(scenario())
+    process = FakeStreamProcess.last_instance
+    assert process.argv[0] == "pw-record"
+    assert "--raw" in process.argv
+    assert process.argv.index("--raw") < process.argv.index("-")
+    assert process.argv[-1] == "-"
+
+
+def test_file_recorder_pw_record_does_not_ask_for_raw(config, tmp_path):
+    """The file path writes a ``.wav``; the sndfile container is what we want there."""
+    destination = tmp_path / "capture.wav"
+    argv = recorder_mod._record_command("pipewire", destination, config)
+    assert argv[0] == "pw-record"
+    assert "--raw" not in argv
+    assert argv[-1] == str(destination)
+    assert argv[-1].endswith(".wav")
+
+
+def test_file_recorder_pw_record_with_a_device_does_not_ask_for_raw(make_config, tmp_path):
+    """Even with ``--target`` inserted, the file path keeps the sndfile container."""
+    config = make_config(audio_device="alsa_input.usb")
+    destination = tmp_path / "capture.wav"
+    argv = recorder_mod._record_command("pipewire", destination, config)
+    assert "--raw" not in argv
+    assert argv[argv.index("--target") + 1] == "alsa_input.usb"
+    assert argv[-1] == str(destination)
+
+
 # -- lifecycle -------------------------------------------------------------
 
 
