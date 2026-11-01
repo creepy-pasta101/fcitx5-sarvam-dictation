@@ -248,6 +248,11 @@ FCITX_CONFIGURATION(
         true};
     Option<bool> showRecordingTips{
         this, "ShowRecordingTips", _("Show a tip while recording"), false};
+    // Streaming sends partial transcripts while the user is still speaking, and
+    // the indicator shows them. This keeps the state feedback (Listening,
+    // Transcribing) while turning the text itself off.
+    Option<bool> showPartialText{
+        this, "ShowPartialText", _("Show the transcript in the indicator"), true};
     // On by default: on KDE Plasma the recording indicator is Plasma's own OSD,
     // which needs no configuration and is invisible on every other desktop.
     Option<bool> showOsd{
