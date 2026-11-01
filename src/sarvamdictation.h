@@ -50,6 +50,21 @@ namespace fcitx {
 // code; the addon keeps using the bare name.
 using sarvam::SarvamDictationConfig;
 
+/*
+ * The write-only API key field shows this sentinel instead of the key.
+ *
+ * fcitx5-configtool has no password widget: it renders an
+ * Option<std::string> as a plain QLineEdit and understands only the
+ * Enum, EnumI18n, IntMin, IntMax and ListConstrain hints -- there is no
+ * EchoMode and no Password hint in it (verified in its source). The
+ * addon side therefore cannot ask the toolkit to mask the input, and the
+ * field is write-only rather than masked: the option carries this
+ * sentinel, the real key stays in config.toml (mode 0600), and setConfig
+ * maps the sentinel back to the stored key before saving, so it can
+ * never reach the file.
+ */
+constexpr char kMaskedApiKey[] = "********";
+
 /**
  * A dictation addon instance.
  *
@@ -145,6 +160,12 @@ private:
     Instance *instance_;
     SarvamDictationConfig config_;
 
+    // The real API key, held in memory only while the ApiKey option shows
+    // kMaskedApiKey. Filled by reloadConfig(), consulted and refreshed by
+    // setConfig(); it is never written to any file other than the
+    // daemon's config.toml.
+    std::string storedApiKey_;
+
     // Handlers unregister themselves when the vector is destroyed.
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         eventHandlers_;
@@ -171,6 +192,12 @@ private:
     // sends "stop" only when this is "recording" and "cancel" otherwise; see
     // endPushToTalk().
     std::string lastState_;
+    // The newest partial transcript currently on screen. A partial can
+    // arrive ten times a second, so one identical to this is dropped
+    // before it costs anything; the member is cleared when a "result" or
+    // a "state" message arrives, because the recording it described is
+    // over.
+    std::string lastPartial_;
 
     std::string readBuffer_;
     std::string writeBuffer_;
