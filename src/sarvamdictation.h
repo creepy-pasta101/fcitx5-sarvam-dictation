@@ -132,6 +132,16 @@ private:
 
     void scheduleRetry();
     bool onRetryTimer();
+    /// Arm the trailing-edge partial timer for kPartialIntervalUsec, unless it
+    /// is already armed. Does nothing when the event loop refused the timer.
+    void armPartialTimer();
+    /// Trailing-edge handler for the partial transcript: show the pending text
+    /// when it differs from what is already on the indicator, then disarm.
+    /// Always returns false, because the source is one-shot.
+    bool onPartialTimer();
+    /// Drop the pending partial, disarm the timer and forget what was shown,
+    /// so the next recording never starts from a stale tail.
+    void clearPartialDisplay();
     void reportUnreachable();
     void spawnDaemon();
 
@@ -172,6 +182,12 @@ private:
 
     std::unique_ptr<EventSourceIO> ioEvent_;
     std::unique_ptr<EventSourceTime> retryTimer_;
+    // Trailing-edge timer for the partial transcript. The daemon emits about
+    // ten partials a second and every indicator update forks a D-Bus client,
+    // so the newest text waits here and is shown at most about three times a
+    // second. Created exactly like retryTimer_, and null if the event loop
+    // refused it.
+    std::unique_ptr<EventSourceTime> partialTimer_;
 
     int fd_ = -1;
     bool connecting_ = false;
@@ -192,12 +208,19 @@ private:
     // sends "stop" only when this is "recording" and "cancel" otherwise; see
     // endPushToTalk().
     std::string lastState_;
-    // The newest partial transcript currently on screen. A partial can
-    // arrive ten times a second, so one identical to this is dropped
-    // before it costs anything; the member is cleared when a "result" or
-    // a "state" message arrives, because the recording it described is
-    // over.
-    std::string lastPartial_;
+    // The newest partial transcript, waiting for the trailing-edge timer,
+    // and the text currently on the indicator. A partial that sanitises to
+    // the same text as the latter is not shown again, so an unchanged
+    // transcript costs no D-Bus fork at all. Both are cleared when a
+    // "result", a "state" message or a cancel ends the recording they
+    // described.
+    std::string pendingPartial_;
+    std::string lastShownPartial_;
+    // True between arming partialTimer_ and it firing. Tracked here rather
+    // than read back with EventSource::isEnabled(), because what a one-shot
+    // source reports after it has fired depends on the event-loop backend
+    // fcitx5 was built with.
+    bool partialTimerArmed_ = false;
 
     std::string readBuffer_;
     std::string writeBuffer_;
