@@ -62,6 +62,21 @@ Six commands. `id` is a client-generated UUIDv4 in hex form and is required on e
 
 `ping` replies `{"v":1,"type":"pong"}` and carries no `id`. It exists so a client can check liveness without disturbing a recording, and it is what keeps the socket demonstrably responsive while transcription runs in a worker thread.
 
+### The command name carries the mode
+
+A recording can be started in one of two ways, and each way streams according to a setting of its own. The mapping is load-bearing rather than incidental: the command name is what tells the daemon which mode it is in, and therefore which streaming setting applies.
+
+| Command that starts the recording | Interaction | Streaming setting used |
+|---|---|---|
+| `start`, ended by `stop` | Push-to-talk: the key is held down, and its release ends the recording. | `[api] streaming_push_to_talk` |
+| `toggle` | Record and send: the trigger key starts the recording and the same key ends it. | `[api] streaming_toggle` |
+
+The daemon decides when the recording starts, from the command that started it. A `start` is the push-to-talk shape and reads `[api] streaming_push_to_talk`; a `toggle` that starts a recording is the record-and-send shape and reads `[api] streaming_toggle`. Nothing else about the two paths differs: both go through the same start path, the same busy check and the same auto-stop scheduling, and both end in the same `result`. A `stop` carries no setting of its own — it ends the recording that `start` began, and that recording streams or does not according to how it was started. A `toggle` that arrives while a recording is in progress is a stop, not a second start: it ends the recording in progress under the setting that recording began with, and it does not re-read the config file.
+
+No new field was added to the protocol for this, and none is needed. The two shapes were already distinct commands before either of them could stream, so the command name carries the mode. There is no `mode` field on a command, no extra argument on `start`, and no new message type; the `v` of every message stays at `1`, because nothing about the meaning of an existing field changed. A client that predates the split needs no change at all: it sends the same two commands it always did, and the daemon resolves the setting for it.
+
+How a setting is resolved from the config file — the per-mode key, then the legacy `[api] streaming`, then false — is described in [ARCHITECTURE.md](ARCHITECTURE.md). The protocol carries the consequence of that resolution and not the resolution itself: a streaming recording is started, stopped and cancelled with `start`, `stop`, `toggle` and `cancel`, exactly as a file-based one is.
+
 ## Server to client
 
 Six message types.
@@ -114,7 +129,7 @@ An empty transcript is a legal, successful outcome — silence, a muted micropho
 | `id` | string | The `id` of the `start` (or `toggle`-that-started) command that began the recording. |
 | `text` | string | The latest partial transcript for the whole recording so far, already whitespace-stripped. Never empty. |
 
-`partial` exists only while a streaming recording is in progress — that is, when `[api] streaming` is on — and carries the interim text the realtime service has recognised so far. The addon shows it through the recording indicator, which is what makes push-to-talk feel live: the words appear while the user is still speaking. The `text` is cumulative, not incremental: it is the whole recording up to that moment, so a client replaces what it is displaying rather than appending to it, and a client that misses one `partial` loses nothing but a frame. It carries the `id` of the `start` that began the recording, not of the `stop` that ends it, so a client with more than one session in its history can match a partial to the session it belongs to.
+`partial` exists only while a streaming recording is in progress — that is, when the streaming setting for the mode that started it is on, `[api] streaming_push_to_talk` for a `start` and `[api] streaming_toggle` for a `toggle` — and carries the interim text the realtime service has recognised so far. The addon shows it through the recording indicator, which is what makes push-to-talk feel live: the words appear while the user is still speaking. The `text` is cumulative, not incremental: it is the whole recording up to that moment, so a client replaces what it is displaying rather than appending to it, and a client that misses one `partial` loses nothing but a frame. It carries the `id` of the `start` that began the recording, not of the `stop` that ends it, so a client with more than one session in its history can match a partial to the session it belongs to.
 
 It is delivered only to the owner of the recording, never broadcast, and it is throttled: the daemon sends at most one `partial` per 100 ms, about ten per second, and always delivers the last text it has seen, so the client's view lags the service by no more than that interval. A partial identical to the one last sent is not sent again, which keeps a long pause from producing a run of identical frames; a client may therefore assume that each `partial` it receives differs from the previous one, and it must not assume any particular interval between them beyond that minimum.
 
@@ -238,7 +253,7 @@ S: {"v":1,"type":"state","state":"idle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
 
 The `reload` right after the connect is the addon catching the daemon up with `config.toml`: the addon had read the file, and the daemon may have been running since before the last change. The answer is `reloaded`, with no `state` line in between, because a reload is not a transition. The first `toggle` then starts the recording and makes this connection its owner; the resulting `state` carries that command's `id`. The second `toggle` stops it, producing a `transcribing` state, then the `result`, then the `idle` state as the daemon returns to rest. The addon commits `text` to the input context it captured at the first press, appends a space, and closes the "Transcribing…" notification when the `idle` arrives.
 
-A streaming recording is the same session with `partial` frames in the middle. With `[api] streaming` on, the daemon transcribes while the audio arrives and forwards the interim text to the owner:
+A streaming recording is the same session with `partial` frames in the middle. With the streaming setting for the mode in use on — `[api] streaming_toggle` for this `toggle` session — the daemon transcribes while the audio arrives and forwards the interim text to the owner:
 
 ```
 C: {"v":1,"cmd":"toggle","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
