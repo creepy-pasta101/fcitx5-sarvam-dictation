@@ -489,6 +489,10 @@ std::string friendlyErrorText(const std::string &code) {
     if (code == "internal") {
         return _("The dictation daemon hit an internal error.");
     }
+    if (code == "config_invalid") {
+        return _("The dictation settings cannot be used with the chosen "
+                 "model.");
+    }
     return _("Dictation failed.");
 }
 
