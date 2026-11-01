@@ -749,6 +749,14 @@ void SarvamDictation::setConfig(const RawConfig &config) {
         storedApiKey_ = config_.apiKey.value();
     }
 
+    // Switching the transcript off while a recording is streaming must take
+    // the text that is already on screen away now, rather than leaving it
+    // there until the recording ends. The state messages are untouched: they
+    // travel through showRecordingIndicator(), not through the partial path.
+    if (!config_.showPartialText.value()) {
+        clearPartialDisplay();
+    }
+
     // Only the addon's own options may reach the fcitx5 conf. Writing the whole
     // Configuration would put the API key into a second file, which is exactly
     // what storing the daemon settings in config.toml is meant to avoid.
@@ -764,6 +772,9 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     addonOnly.setValueByPath(
         "ShowRecordingTips",
         config_.showRecordingTips.value() ? "True" : "False");
+    addonOnly.setValueByPath(
+        "ShowPartialText",
+        config_.showPartialText.value() ? "True" : "False");
     addonOnly.setValueByPath("AppendSpace",
                              config_.appendSpace.value() ? "True" : "False");
     safeSaveAsIni(addonOnly, "conf/sarvamdictation.conf");
@@ -1165,6 +1176,11 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "partial") {
+        if (!config_.showPartialText.value()) {
+            // The user asked for state feedback without the text. Nothing is
+            // stored and no timer is armed, so a partial costs nothing at all.
+            return;
+        }
         // A live partial transcript of the recording in progress. It is not
         // shown here: it arrives about ten times a second, every indicator
         // update forks a D-Bus client, and Plasma restarts the OSD's fade-in
