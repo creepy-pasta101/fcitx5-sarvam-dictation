@@ -65,6 +65,8 @@ constexpr char kApiKey[] = "ApiKey";
 constexpr char kModel[] = "Model";
 constexpr char kMode[] = "Mode";
 constexpr char kStreaming[] = "Streaming";
+constexpr char kStreamingPushToTalk[] = "StreamingPushToTalk";
+constexpr char kStreamingToggle[] = "StreamingToggle";
 constexpr char kLanguageCode[] = "LanguageCode";
 constexpr char kKeyterms[] = "Keyterms";
 constexpr char kAudioDevice[] = "AudioDevice";
@@ -370,6 +372,49 @@ bool applyBool(const TomlDocument &document, const char *section,
     return true;
 }
 
+/// The two per-mode streaming flags.
+///
+/// Precedence, per mode: the mode's own key if the file has it, else the legacy
+/// `api.streaming` if that one is present, else the option's own default
+/// (false). A per-mode key that is present is never replaced by the legacy
+/// value, so a file that already carries both keeps what it says. The legacy
+/// key is therefore consulted only for a mode whose own key is missing, and it
+/// is not validated when both per-mode keys are there.
+///
+/// A mode with neither key is left out of `raw` entirely, which is the existing
+/// behaviour: an option the file does not mention keeps its current value.
+bool applyStreaming(const TomlDocument &document, RawConfig &raw,
+                    std::string *error) {
+    const bool hasPushToTalk =
+        document.get("api", "streaming_push_to_talk") != nullptr;
+    const bool hasToggle = document.get("api", "streaming_toggle") != nullptr;
+    const bool hasLegacy = document.get("api", "streaming") != nullptr;
+
+    if (hasPushToTalk) {
+        if (!applyBool(document, "api", "streaming_push_to_talk",
+                       kStreamingPushToTalk, raw, error)) {
+            return false;
+        }
+    } else if (hasLegacy) {
+        if (!applyBool(document, "api", "streaming", kStreamingPushToTalk, raw,
+                       error)) {
+            return false;
+        }
+    }
+    if (hasToggle) {
+        if (!applyBool(document, "api", "streaming_toggle", kStreamingToggle,
+                       raw, error)) {
+            return false;
+        }
+    } else if (hasLegacy) {
+        if (!applyBool(document, "api", "streaming", kStreamingToggle, raw,
+                       error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool applyKeyterms(const TomlDocument &document, RawConfig &raw,
                    std::string *error) {
     const TomlValue *value = document.get("api", "keyterms");
@@ -586,7 +631,7 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
         !applyEnum<DictationModel>(document, "api", "model", kModel, raw,
                                    error) ||
         !applyEnum<DictationMode>(document, "api", "mode", kMode, raw, error) ||
-        !applyBool(document, "api", "streaming", kStreaming, raw, error) ||
+        !applyStreaming(document, raw, error) ||
         !applyLanguageCode(document, raw, error) ||
         !applyKeyterms(document, raw, error) ||
         !applyString(document, "audio", "device", kAudioDevice, raw, error) ||
@@ -603,10 +648,12 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
     // and any daemon key the file does not mention - keep their current value.
     config.load(raw, /*partial=*/true);
 
-    // The daemon forces streaming on for saaras:v3-realtime, so the page shows
-    // the state the daemon will actually be in instead of a stale toggle.
+    // The daemon forces streaming on for both modes for saaras:v3-realtime,
+    // because that model cannot run on REST at all, so the page shows the state
+    // the daemon will actually be in instead of two stale toggles.
     if (config.model.value() == DictationModel::SaarasV3Realtime) {
-        config.streaming.setValue(true);
+        config.streamingPushToTalk.setValue(true);
+        config.streamingToggle.setValue(true);
     }
     return true;
 }
@@ -656,13 +703,27 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
     document.set("api", "key", TomlValue::string(optionText(raw, kApiKey)));
     document.set("api", "model", TomlValue::string(optionText(raw, kModel)));
     document.set("api", "mode", TomlValue::string(optionText(raw, kMode)));
-    // The daemon forces streaming on for saaras:v3-realtime whatever the
-    // Streaming toggle says, so the file must not claim otherwise: write the
-    // state the daemon will actually be in.
-    const bool streamingForFile =
-        optionBool(raw, kStreaming, false) ||
+    // The daemon forces streaming on for both modes for saaras:v3-realtime
+    // whatever the two toggles say, so the file must not claim otherwise: write
+    // the state the daemon will actually be in.
+    const bool realtimeOnly =
         config.model.value() == DictationModel::SaarasV3Realtime;
-    document.set("api", "streaming", TomlValue::boolean(streamingForFile));
+    const bool pushToTalkForFile =
+        optionBool(raw, kStreamingPushToTalk, false) || realtimeOnly;
+    const bool toggleForFile =
+        optionBool(raw, kStreamingToggle, false) || realtimeOnly;
+    document.set("api", "streaming_push_to_talk",
+                 TomlValue::boolean(pushToTalkForFile));
+    document.set("api", "streaming_toggle",
+                 TomlValue::boolean(toggleForFile));
+    // `api.streaming` is the legacy key: a daemon that predates the per-mode
+    // flags reads that one key and applies it to both modes. It is written
+    // true only when both modes stream and false otherwise, so an older daemon
+    // streams when streaming is right for both modes and stays on batch when
+    // the two disagree -- it cannot express the difference, and of the two
+    // wrong answers batch is the safe one.
+    document.set("api", "streaming",
+                 TomlValue::boolean(pushToTalkForFile && toggleForFile));
     document.set("api", "language_code",
                  TomlValue::string(languageCodeForFile(raw)));
     document.set("api", "keyterms", TomlValue::array(keytermsFromRaw(raw)));

@@ -20,6 +20,11 @@ The streaming fakes mirror the frozen ``StreamingRecorder`` /
 ``cancel`` and ``open``/``feed``/``finish``/``cancel``) and are injected through
 ``stream_recorder_factory`` and ``stream_transcriber_factory``. No audio
 hardware, no socket to Sarvam, and no ``sarvamai`` SDK is touched.
+
+The final section covers brief 15: the transport is chosen per dictation mode,
+and the command name carries the mode. ``start`` is the push-to-talk shape and
+reads ``[api] streaming_push_to_talk``; ``toggle`` is the record-and-send shape
+and reads ``[api] streaming_toggle``. No protocol message changed.
 """
 
 from __future__ import annotations
@@ -1193,8 +1198,12 @@ def test_the_partial_interval_is_a_tenth_of_a_second():
 
 @pytest.fixture
 def streaming_config(make_config):
-    """A ``Config`` with the live path on, using a model that supports it."""
-    return make_config(streaming=True, model="saaras:v4")
+    """A ``Config`` with the live path on for both modes, model permitting.
+
+    Brief 15 splits the switch per dictation mode, so the brief 7 scenarios -
+    which drive ``start`` and ``toggle`` interchangeably - need both on.
+    """
+    return make_config(streaming_push_to_talk=True, streaming_toggle=True, model="saaras:v4")
 
 
 def test_streaming_start_sends_a_partial_and_stop_sends_the_result(
@@ -1636,7 +1645,9 @@ def test_streaming_toggle_starts_and_stops_the_live_path(tmp_path, streaming_con
 
 def test_streaming_auto_stop_uses_the_same_timer(tmp_path, make_config):
     sock = tmp_path / "dictation.sock"
-    config = make_config(streaming=True, model="saaras:v4", max_duration_s=1)
+    config = make_config(
+        streaming_push_to_talk=True, streaming_toggle=True, model="saaras:v4", max_duration_s=1
+    )
     kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
     server, kit = make_streaming_server(config, sock, kit)
 
@@ -1700,7 +1711,8 @@ def test_the_realtime_model_from_a_config_file_selects_the_live_path(tmp_path):
         encoding="utf-8",
     )
     config = load_config(config_file, env={})
-    assert config.streaming is True
+    assert config.streaming_push_to_talk is True
+    assert config.streaming_toggle is True
 
     kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
     server, kit = make_streaming_server(config, sock, kit, config_path=config_file)
@@ -1747,3 +1759,251 @@ def test_streaming_leaves_no_task_behind_after_shutdown(tmp_path, streaming_conf
     asyncio.run(scenario())
     assert kit.recorder.cancel_calls >= 1
     assert kit.transcriber.cancel_calls >= 1
+
+
+# --------------------------------------------------------------------------
+# choosing the transport per dictation mode (brief 15)
+# --------------------------------------------------------------------------
+
+
+def make_per_mode_server(
+    config, socket_path, kit, recorder_factory, transcriber_factory
+):
+    """A server wired to both the file-based fakes and the streaming kit.
+
+    Which one a job uses is then purely the daemon's decision, so a test can
+    assert that exactly one of them was consulted.
+    """
+    return DictationServer(
+        config,
+        recorder_factory=recorder_factory,
+        transcriber_factory=transcriber_factory,
+        stream_recorder_factory=kit.recorder_factory,
+        stream_transcriber_factory=kit.transcriber_factory,
+        socket_path=str(socket_path),
+    )
+
+
+def test_start_streams_when_only_push_to_talk_is_on(
+    tmp_path, make_config, recorder_factory, transcriber_factory
+):
+    sock = tmp_path / "dictation.sock"
+    config = make_config(
+        model="saaras:v4", streaming_push_to_talk=True, streaming_toggle=False
+    )
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server = make_per_mode_server(config, sock, kit, recorder_factory, transcriber_factory)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "p1"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("नमस्ते"))
+            await client.send({"v": 1, "cmd": "stop", "id": "p2"})
+            assert (await client.read_until(is_type("result")))["id"] == "p2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder_factory.calls == 1
+    assert kit.transcriber_factory.calls == 1
+    assert kit.transcriber.finish_calls == 1
+    assert recorder_factory.calls == 0
+    assert transcriber_factory.calls == 0
+
+
+def test_toggle_does_not_stream_when_only_push_to_talk_is_on(
+    tmp_path, make_config, recorder_factory, transcriber_factory
+):
+    # The same configuration as the test above: ``start`` streams, ``toggle``
+    # must not, because only ``streaming_push_to_talk`` is on.
+    sock = tmp_path / "dictation.sock"
+    config = make_config(
+        model="saaras:v4", streaming_push_to_talk=True, streaming_toggle=False
+    )
+    kit = StreamKit()
+    server = make_per_mode_server(config, sock, kit, recorder_factory, transcriber_factory)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "toggle", "id": "t1"})
+            assert (await client.read_until(is_state("recording")))["id"] == "t1"
+            await client.send({"v": 1, "cmd": "toggle", "id": "t2"})
+            assert (await client.read_until(is_type("result")))["id"] == "t2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder_factory.calls == 0
+    assert kit.transcriber_factory.calls == 0
+    assert kit.recorder.start_calls == 0
+    assert kit.transcriber.open_calls == 0
+    assert recorder_factory.calls == 1
+    assert recorder_factory.recorder.start_calls == 1
+    assert recorder_factory.recorder.stop_calls == 1
+    assert len(transcriber_factory.transcriber.calls) == 1
+
+
+def test_toggle_streams_when_only_toggle_is_on(
+    tmp_path, make_config, recorder_factory, transcriber_factory
+):
+    sock = tmp_path / "dictation.sock"
+    config = make_config(
+        model="saaras:v4", streaming_push_to_talk=False, streaming_toggle=True
+    )
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server = make_per_mode_server(config, sock, kit, recorder_factory, transcriber_factory)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "toggle", "id": "m1"})
+            assert (await client.read_until(is_state("recording")))["id"] == "m1"
+            await client.read_until(is_partial("नमस्ते"))
+            await client.send({"v": 1, "cmd": "toggle", "id": "m2"})
+            assert (await client.read_until(is_type("result")))["id"] == "m2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder_factory.calls == 1
+    assert kit.transcriber_factory.calls == 1
+    assert recorder_factory.calls == 0
+    assert transcriber_factory.calls == 0
+
+
+def test_start_does_not_stream_when_only_toggle_is_on(
+    tmp_path, make_config, recorder_factory, transcriber_factory
+):
+    sock = tmp_path / "dictation.sock"
+    config = make_config(
+        model="saaras:v4", streaming_push_to_talk=False, streaming_toggle=True
+    )
+    kit = StreamKit()
+    server = make_per_mode_server(config, sock, kit, recorder_factory, transcriber_factory)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "s2"})
+            assert (await client.read_until(is_type("result")))["id"] == "s2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder_factory.calls == 0
+    assert kit.transcriber_factory.calls == 0
+    assert recorder_factory.calls == 1
+    assert recorder_factory.recorder.start_calls == 1
+    assert len(transcriber_factory.transcriber.calls) == 1
+
+
+def test_toggle_stops_a_streaming_recording_rather_than_starting_a_second(
+    tmp_path, make_config
+):
+    sock = tmp_path / "dictation.sock"
+    config = make_config(
+        model="saaras:v4", streaming_push_to_talk=False, streaming_toggle=True
+    )
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "toggle", "id": "x1"})
+            assert (await client.read_until(is_state("recording")))["id"] == "x1"
+            await client.read_until(is_partial("नमस्ते"))
+            await client.send({"v": 1, "cmd": "toggle", "id": "x2"})
+            assert (await client.read_until(is_state("transcribing")))["id"] == "x2"
+            assert (await client.read_until(is_type("result")))["id"] == "x2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    # One recording, ended by the second toggle: never a second start.
+    assert kit.recorder.start_calls == 1
+    assert kit.recorder.stop_calls == 1
+    assert kit.transcriber.open_calls == 1
+    assert kit.transcriber.finish_calls == 1
+    assert kit.transcriber.cancel_calls == 0
+
+
+def test_toggle_stops_a_batched_recording_rather_than_starting_a_second(
+    tmp_path, config, recorder_factory, transcriber_factory
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit()
+    server = make_per_mode_server(config, sock, kit, recorder_factory, transcriber_factory)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "toggle", "id": "b1"})
+            assert (await client.read_until(is_state("recording")))["id"] == "b1"
+            await client.send({"v": 1, "cmd": "toggle", "id": "b2"})
+            assert (await client.read_until(is_state("transcribing")))["id"] == "b2"
+            assert (await client.read_until(is_type("result")))["id"] == "b2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert recorder_factory.calls == 1
+    assert recorder_factory.recorder.start_calls == 1
+    assert recorder_factory.recorder.stop_calls == 1
+    assert kit.recorder.start_calls == 0
+
+
+def test_a_config_file_with_only_streaming_toggle_streams_toggle_only(
+    tmp_path, recorder_factory, transcriber_factory
+):
+    """End to end: the per-mode key from ``config.toml`` drives the dispatch."""
+    sock = tmp_path / "dictation.sock"
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[api]\nkey = "fake-key-not-real"\nmodel = "saaras:v4"\n'
+        "streaming_toggle = true\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_file, env={})
+    assert config.streaming_toggle is True
+    assert config.streaming_push_to_talk is False
+
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server = DictationServer(
+        config,
+        recorder_factory=recorder_factory,
+        transcriber_factory=transcriber_factory,
+        stream_recorder_factory=kit.recorder_factory,
+        stream_transcriber_factory=kit.transcriber_factory,
+        socket_path=str(sock),
+        config_path=str(config_file),
+    )
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            # ``start`` is push-to-talk, which this file left on batch.
+            await client.send({"v": 1, "cmd": "start", "id": "c1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "c2"})
+            assert (await client.read_until(is_type("result")))["id"] == "c2"
+            await client.read_until(is_state("idle"))
+            # ``toggle`` is record-and-send, which this file turned on.
+            await client.send({"v": 1, "cmd": "toggle", "id": "c3"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("नमस्ते"))
+            await client.send({"v": 1, "cmd": "toggle", "id": "c4"})
+            assert (await client.read_until(is_type("result")))["id"] == "c4"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert recorder_factory.calls == 1
+    assert kit.recorder_factory.calls == 1
+    assert kit.recorder.start_calls == 1
+    assert kit.transcriber.finish_calls == 1
