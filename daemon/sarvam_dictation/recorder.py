@@ -8,6 +8,7 @@ always sees exactly one format.
 from __future__ import annotations
 
 import array
+import asyncio
 import contextlib
 import logging
 import shutil
@@ -18,6 +19,7 @@ import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterator
 from uuid import uuid4
 
 from .config import Config
@@ -470,3 +472,238 @@ def _resample_linear(samples: array.array, rate: int, target_rate: int) -> array
         high = samples[left + 1]
         output[index] = int(low + (high - low) * fraction)
     return output
+
+
+#: How much raw PCM one ``chunks()`` read asks for: 4096 bytes is 128 ms of
+#: 16 kHz mono s16le, small enough to keep partial transcripts responsive.
+STREAM_CHUNK_SIZE = 4096
+
+#: How long ``stop()`` spends sweeping audio still buffered in the pipe.
+STREAM_DRAIN_TIMEOUT_S = 1.0
+
+#: How often the shutdown ladder checks whether the child has exited. asyncio's
+#: ``Process.wait()`` only resolves once the child's pipe is closed as well, and
+#: nothing is reading that pipe while we are shutting down, so the exit is
+#: detected from ``returncode`` instead.
+STREAM_EXIT_POLL_S = 0.02
+
+#: How long ``stop()`` waits to reap a child whose pipe has already been drained.
+STREAM_REAP_TIMEOUT_S = 2.0
+
+
+class StreamingRecorder:
+    """Captures raw PCM for a streaming transcription.
+
+    Where :class:`Recorder` hands the capture tool a file path and gets a WAV
+    back, this class asks the same tool for **raw s16le mono PCM on its
+    stdout** - exactly the ``linear16`` format the realtime endpoint wants, so
+    there is no header to parse and no normalisation step:
+
+    * ``pw-record --format s16 --rate R --channels 1 -``
+    * ``parec --format=s16le --rate=R --channels=1 --raw``
+    * ``arecord -f S16_LE -r R -c 1 -t raw``
+
+    The graceful shutdown ladder is the one the file-based recorder uses:
+    SIGINT, then SIGTERM, then SIGKILL. ``stop()`` is safe when ``start()`` was
+    never called, and :meth:`chunks` ends when the child exits.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._proc = None
+        self._bytes = 0
+        #: Serialises reads so ``chunks()`` and the stop-time drain never race
+        #: for the same pipe.
+        self._read_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        """Spawn the capture tool writing raw s16le mono PCM to its stdout.
+
+        Raises :class:`RecorderError` with ``code="no_audio_device"`` when no
+        capture tool is available or the tool cannot be spawned.
+        """
+        if self._proc is not None:
+            raise RecorderError(
+                "a streaming recording is already in progress", code="audio_failed"
+            )
+
+        backend = detect_backend(self._config.backend)
+        argv = _stream_command(backend, self._config)
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                # Raw PCM is the payload: stderr carries only diagnostics, and
+                # an unread PIPE could block a chatty tool, so discard it.
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self._proc = None
+            raise RecorderError(
+                f"failed to start {argv[0]}: {exc}", code="no_audio_device"
+            ) from exc
+
+        self._bytes = 0
+        logger.debug("streaming capture with %s (pid %s)", argv[0], self._proc.pid)
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        """Yield PCM chunks as they arrive, of whatever size the tool produces.
+
+        Ends when the child exits (its stdout reaches EOF) or the stream is
+        closed underneath us; never raises for either.
+        """
+        proc = self._proc
+        stream = getattr(proc, "stdout", None) if proc is not None else None
+        if stream is None:
+            return
+        while True:
+            try:
+                data = await self._read(stream)
+            except asyncio.CancelledError:
+                raise
+            except (ValueError, OSError) as exc:
+                logger.debug("streaming capture pipe closed: %s", exc)
+                return
+            if not data:
+                return
+            self._bytes += len(data)
+            yield data
+
+    async def stop(self) -> int:
+        """Stop capture gracefully and return the captured duration in ms.
+
+        Uses the same SIGINT -> SIGTERM -> SIGKILL ladder as the file-based
+        recorder, then sweeps whatever the tool had already buffered. Safe to
+        call when ``start()`` was never called (returns 0).
+        """
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return self.duration_ms
+
+        try:
+            await self._terminate(proc)
+            # Reading to EOF is also what lets asyncio close the pipe, so the
+            # child can be reaped below.
+            await self._drain(proc)
+            await self._reap(proc)
+        finally:
+            logger.debug("captured %d ms of streaming audio", self.duration_ms)
+        return self.duration_ms
+
+    async def cancel(self) -> None:
+        """Stop and discard. Idempotent."""
+        proc = self._proc
+        self._proc = None
+        self._bytes = 0
+        if proc is None:
+            return
+        try:
+            await self._terminate(proc)
+            await self._drain(proc)
+            await self._reap(proc)
+        except OSError as exc:  # pragma: no cover - signal races only
+            logger.debug("error while stopping streaming recorder: %s", exc)
+
+    @property
+    def duration_ms(self) -> int:
+        """Duration of the audio read so far, from the byte count."""
+        rate = self._config.sample_rate
+        if rate <= 0:
+            return 0
+        return int(round(self._bytes * 1000.0 / (2.0 * rate)))
+
+    async def _read(self, stream) -> bytes:
+        """One serialised read from the capture pipe."""
+        async with self._read_lock:
+            return await stream.read(STREAM_CHUNK_SIZE)
+
+    async def _terminate(self, proc) -> None:
+        """Run the graceful shutdown ladder; SIGKILL is only ever the last resort."""
+        if proc.returncode is not None:
+            return
+        for sig, grace in ((signal.SIGINT, SIGINT_GRACE_S), (signal.SIGTERM, SIGTERM_GRACE_S)):
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                return
+            except OSError as exc:  # pragma: no cover
+                logger.debug("cannot signal streaming recorder: %s", exc)
+                break
+            if await self._wait_exit(proc, grace):
+                return
+            logger.debug("streaming recorder ignored signal %s; escalating", sig.name)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        except OSError as exc:  # pragma: no cover
+            logger.debug("cannot kill streaming recorder: %s", exc)
+            return
+        if not await self._wait_exit(proc, SIGKILL_GRACE_S):  # pragma: no cover
+            logger.warning("streaming recorder pid %s did not die after SIGKILL", proc.pid)
+
+    async def _wait_exit(self, proc, timeout: float) -> bool:
+        """True when the child exited within ``timeout``.
+
+        ``returncode`` is set as soon as the child is reaped, independently of
+        its stdout pipe; ``Process.wait()`` is not, so this must not block on it.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while proc.returncode is None:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(STREAM_EXIT_POLL_S)
+        return True
+
+    async def _reap(self, proc) -> None:
+        """Collect the child once its pipe has been drained."""
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=STREAM_REAP_TIMEOUT_S)
+        except asyncio.TimeoutError:  # pragma: no cover - unkillable child
+            logger.debug("streaming recorder pid %s was not reaped", proc.pid)
+        except (ProcessLookupError, OSError):  # pragma: no cover
+            pass
+
+    async def _drain(self, proc) -> None:
+        """Count any audio still buffered in the pipe after the child stopped."""
+        stream = getattr(proc, "stdout", None)
+        if stream is None:
+            return
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    self._read(stream), timeout=STREAM_DRAIN_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, ValueError, OSError, AttributeError):
+                return
+            if not data:
+                return
+            self._bytes += len(data)
+
+
+def _stream_command(backend: str, config: Config) -> list[str]:
+    """Build the recorder argv for ``backend`` writing raw PCM to stdout."""
+    rate = str(config.sample_rate)
+    device = config.audio_device
+    if backend == "pipewire":
+        argv = ["pw-record", "--rate", rate, "--channels", "1", "--format", "s16"]
+        if device:
+            argv += ["--target", device]
+        argv.append("-")
+        return argv
+    if backend == "pulse":
+        argv = ["parec", "--format=s16le", f"--rate={rate}", "--channels=1", "--raw"]
+        if device:
+            argv.append(f"--device={device}")
+        return argv
+    if backend == "alsa":
+        argv = ["arecord", "-q", "-f", "S16_LE", "-r", rate, "-c", "1", "-t", "raw"]
+        if device:
+            argv += ["-D", device]
+        argv.append("-")
+        return argv
+    raise RecorderError(f"unknown audio backend {backend!r}", code="no_audio_device")
