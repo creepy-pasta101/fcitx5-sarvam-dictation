@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import sarvam_dictation.streaming as streaming
+from sarvam_dictation.config import REALTIME_MODEL, REST_MODELS, STREAMING_MODELS
 from sarvam_dictation.streaming import RealtimeTranscriber, StreamingError, Transcript
 
 FAKE_KEY = "sk-fake-0000000000000000-not-a-real-key"
@@ -246,6 +247,12 @@ def test_streaming_error_codes_are_the_protocol_vocabulary():
     assert exc.code == "api"
     assert str(exc) == "boom"
     assert StreamingError("other").code == "internal"
+    assert StreamingError("bad model", code="config_invalid").code == "config_invalid"
+
+
+def test_the_realtime_models_are_the_ones_config_declares():
+    # No second copy of the tuple in this module: config.py is the source.
+    assert streaming.REALTIME_MODELS is STREAMING_MODELS
 
 
 def test_transcript_is_a_plain_dataclass():
@@ -316,17 +323,36 @@ def test_open_passes_a_configured_language_and_json_keyterms_for_saaras_v4(make_
     assert json.loads(kwargs["keyterms"]) == ["Sarvam", "नई दिल्ली"]
 
 
-def test_open_falls_back_to_the_realtime_model_for_a_rest_only_model(make_config):
+def test_open_refuses_a_rest_only_model_instead_of_substituting_one(make_config):
+    # Brief 8 replaced the old silent fallback: a model the realtime endpoint
+    # does not serve is a configuration mistake, not something to paper over.
     config = make_config(model="saaras:v3")
     client = FakeClient()
 
     async def scenario():
         transcriber = RealtimeTranscriber(config, client=client)
-        await transcriber.open()
-        await transcriber.cancel()
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        assert excinfo.value.code == "config_invalid"
+        assert client.connect_calls == []
+        assert client.enters == 0
+        assert client.socket.sent == []
+        assert other_tasks() == []
 
     asyncio.run(scenario())
-    assert client.connect_calls[0]["model"] == streaming.DEFAULT_REALTIME_MODEL
+
+
+def test_open_passes_the_configured_streaming_model_verbatim(make_config):
+    for model in STREAMING_MODELS:
+        client = FakeClient()
+
+        async def scenario():
+            transcriber = RealtimeTranscriber(make_config(model=model), client=client)
+            await transcriber.open()
+            await transcriber.cancel()
+
+        asyncio.run(scenario())
+        assert client.connect_calls[0]["model"] == model
 
 
 def test_open_sends_speech_start_for_manual_endpointing(make_config):
@@ -828,3 +854,105 @@ def test_an_injected_client_never_imports_the_sdk(make_config, sdk_blocked):
 
     assert asyncio.run(scenario()).text == "नमस्ते"
     assert "sarvamai" not in sys.modules
+
+
+# --------------------------------------------------------------------------
+# the realtime model namespace (brief 8)
+# --------------------------------------------------------------------------
+
+
+REST_ONLY_MODELS = tuple(model for model in REST_MODELS if model not in STREAMING_MODELS)
+
+
+@pytest.mark.parametrize("model", REST_ONLY_MODELS)
+def test_open_refuses_every_rest_only_model_before_connecting(make_config, model):
+    client = FakeClient()
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(model=model), client=client)
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        assert excinfo.value.code == "config_invalid"
+        assert model in str(excinfo.value)
+        assert client.connect_calls == []
+        assert client.enters == 0
+        assert client.socket.sent == []
+        assert other_tasks() == []
+
+    asyncio.run(scenario())
+
+
+def test_open_refuses_a_rest_only_model_without_constructing_a_client(make_config):
+    # No injected client: reaching _resolve_client would try to import the SDK
+    # (and fail with `internal`, since sarvamai is not installed here).
+    # `config_invalid` proves the guard ran before any client work.
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(model="saaras:v3"))
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        assert excinfo.value.code == "config_invalid"
+        assert other_tasks() == []
+
+    asyncio.run(scenario())
+
+
+def test_the_config_invalid_message_names_the_model_and_the_alternatives(make_config):
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(model="saaras:v3"))
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        return str(excinfo.value)
+
+    message = asyncio.run(scenario())
+    assert "saaras:v3" in message
+    assert REALTIME_MODEL in message
+    assert "saaras:v4" in message
+    assert "streaming" in message
+    assert "HTTP" not in message
+    assert "400" not in message
+
+
+def test_an_unknown_model_is_refused_rather_than_replaced(make_config):
+    client = FakeClient()
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(model="whisper-large"), client=client)
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        assert excinfo.value.code == "config_invalid"
+        assert "whisper-large" in str(excinfo.value)
+        assert client.connect_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_the_guard_leaves_a_valid_session_working_end_to_end(make_config):
+    for model in STREAMING_MODELS:
+        socket = FakeSocket([partial("नम"), final("नमस्ते")])
+        client = FakeClient(socket)
+
+        async def scenario():
+            transcriber = RealtimeTranscriber(make_config(model=model), client=client)
+            await transcriber.open()
+            await transcriber.feed(b"\x00\x00" * 32)
+            await pump(socket, 3)
+            return await transcriber.finish()
+
+        transcript = asyncio.run(scenario())
+        assert transcript.text == "नमस्ते"
+        assert client.connect_calls[0]["model"] == model
+        assert client.exits == 1
+
+
+def test_the_guard_does_not_disturb_the_missing_key_check(make_config):
+    # A model that is fine for realtime still reports the missing key first.
+    client = FakeClient()
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(api_key="", model="saaras:v4"), client=client)
+        with pytest.raises(StreamingError) as excinfo:
+            await transcriber.open()
+        assert excinfo.value.code == "no_api_key"
+        assert client.connect_calls == []
+
+    asyncio.run(scenario())

@@ -18,11 +18,13 @@ from pathlib import Path
 
 import pytest
 
+import sarvam_dictation.__main__ as daemon_main
 from sarvam_dictation.config import (
     DEFAULT_MODEL,
     DEFAULT_MODE,
     DEFAULT_SAMPLE_RATE,
     REALTIME_MODEL,
+    REST_MODELS,
     STREAMING_MODELS,
     VALID_BACKENDS,
     VALID_MODES,
@@ -401,3 +403,194 @@ def test_streaming_takes_no_part_in_repr_or_equality_ordering_of_existing_fields
     assert Config(streaming=True) != Config()
     assert dataclasses.replace(Config(), streaming=True) == Config(streaming=True)
     assert Config(streaming=True).model == DEFAULT_MODEL
+
+
+# --------------------------------------------------------------------------
+# the REST model namespace (brief 8)
+# --------------------------------------------------------------------------
+
+
+def test_rest_models_are_the_three_the_rest_endpoint_serves():
+    assert REST_MODELS == ("saarika:v2.5", "saaras:v3", "saaras:v4")
+
+
+def test_the_realtime_only_model_is_not_a_rest_model():
+    # The whole bug: 'saaras:v3-realtime' exists only on the realtime
+    # WebSocket endpoint, so it must never appear in the REST namespace.
+    assert REALTIME_MODEL == "saaras:v3-realtime"
+    assert REALTIME_MODEL not in REST_MODELS
+
+
+def test_saaras_v4_is_the_one_model_both_endpoints_share():
+    assert set(REST_MODELS) & set(STREAMING_MODELS) == {"saaras:v4"}
+
+
+def test_the_two_namespaces_are_disjoint_apart_from_saaras_v4():
+    assert sorted(set(REST_MODELS) | set(STREAMING_MODELS)) == sorted(
+        ["saarika:v2.5", "saaras:v3", "saaras:v3-realtime", "saaras:v4"]
+    )
+
+
+@pytest.mark.parametrize("model", REST_MODELS)
+def test_load_config_accepts_every_rest_model_on_the_rest_path(tmp_path, model):
+    config = load_config(path=write_config(tmp_path, f'[api]\nmodel = "{model}"\n'), env={})
+    assert config.model == model
+    assert config.streaming is False
+
+
+@pytest.mark.parametrize("model", STREAMING_MODELS)
+def test_load_config_accepts_every_streaming_model_with_streaming_on(tmp_path, model):
+    path = write_config(tmp_path, f'[api]\nmodel = "{model}"\nstreaming = true\n')
+    config = load_config(path=path, env={})
+    assert config.model == model
+    assert config.streaming is True
+
+
+REST_ONLY_MODELS = tuple(model for model in REST_MODELS if model not in STREAMING_MODELS)
+
+
+@pytest.mark.parametrize("model", REST_ONLY_MODELS)
+def test_load_config_refuses_a_rest_only_model_with_streaming_on(tmp_path, model):
+    path = write_config(tmp_path, f'[api]\nmodel = "{model}"\nstreaming = true\n')
+    with pytest.raises(ConfigError) as raised:
+        load_config(path=path, env={})
+    assert "[api] streaming" in str(raised.value)
+    assert model in str(raised.value)
+
+
+CANDIDATE_MODELS = tuple(
+    dict.fromkeys(REST_MODELS + STREAMING_MODELS + ("saarika:v2.5", "whisper-large", ""))
+)
+
+
+@pytest.mark.parametrize("model", CANDIDATE_MODELS)
+def test_load_config_streaming_acceptance_agrees_with_streaming_models(tmp_path, model):
+    """``STREAMING_MODELS`` is exactly what ``load_config`` lets stream."""
+    path = write_config(tmp_path, f'[api]\nmodel = "{model}"\nstreaming = true\n')
+    if model in STREAMING_MODELS:
+        assert load_config(path=path, env={}).streaming is True
+    else:
+        with pytest.raises(ConfigError):
+            load_config(path=path, env={})
+
+
+@pytest.mark.parametrize("model", CANDIDATE_MODELS)
+def test_load_config_rest_acceptance_agrees_with_rest_models(tmp_path, model):
+    """Every non-empty model is accepted on the REST path; the guard is in
+    ``transcriber.py``, which is where the endpoint is actually chosen."""
+    path = write_config(tmp_path, f'[api]\nmodel = "{model}"\nstreaming = false\n')
+    if not model:
+        with pytest.raises(ConfigError):
+            load_config(path=path, env={})
+    else:
+        assert load_config(path=path, env={}).model == model
+
+
+def test_adding_rest_models_left_the_existing_constants_alone():
+    assert DEFAULT_MODEL == "saaras:v4"
+    assert STREAMING_MODELS == (REALTIME_MODEL, "saaras:v4")
+    assert DEFAULT_MODEL in REST_MODELS
+    assert DEFAULT_MODEL in STREAMING_MODELS
+
+
+# --------------------------------------------------------------------------
+# --check diagnostics (brief 8 section 1d)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def check_audio(monkeypatch):
+    """Make --check's audio probe deterministic: no hardware in CI."""
+    monkeypatch.setattr(daemon_main, "detect_backend", lambda backend: "pulse")
+
+
+def run_check(config, tmp_path, capsys):
+    """Run ``--check`` on ``config`` and return (exit status, stdout)."""
+    status = daemon_main._run_check(config, tmp_path / "config.toml", None)
+    return status, capsys.readouterr().out
+
+
+def result_line(output: str) -> str:
+    """Return the single ``result:`` line --check printed."""
+    lines = [line for line in output.splitlines() if line.startswith("result:")]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_check_prints_the_rest_endpoint_for_a_rest_configuration(
+    make_config, tmp_path, capsys, check_audio
+):
+    status, out = run_check(make_config(model="saaras:v3", streaming=False), tmp_path, capsys)
+    assert "endpoint:     REST /speech-to-text" in out
+    assert "model:        saaras:v3" in out
+    assert status == 0
+    assert result_line(out) == "result:       OK"
+
+
+def test_check_prints_the_realtime_endpoint_for_a_streaming_configuration(
+    make_config, tmp_path, capsys, check_audio
+):
+    config = make_config(model="saaras:v3-realtime", streaming=True)
+    status, out = run_check(config, tmp_path, capsys)
+    assert "endpoint:     realtime websocket" in out
+    assert "streaming:    on (realtime websocket)" in out
+    assert status == 0
+    assert result_line(out) == "result:       OK"
+
+
+def test_check_accepts_saaras_v4_on_both_endpoints(make_config, tmp_path, capsys, check_audio):
+    for streaming in (False, True):
+        status, out = run_check(make_config(model="saaras:v4", streaming=streaming), tmp_path, capsys)
+        assert status == 0
+        assert result_line(out) == "result:       OK"
+
+
+def test_check_fails_naming_a_rest_only_model_used_with_streaming(
+    make_config, tmp_path, capsys, check_audio
+):
+    config = make_config(model="saaras:v3", streaming=True)
+    status, out = run_check(config, tmp_path, capsys)
+
+    assert status == 1
+    assert "endpoint:     realtime websocket" in out
+    final = result_line(out)
+    assert final.startswith("result:       FAILED (")
+    assert "model 'saaras:v3' cannot be used with streaming" in final
+    assert "saaras:v3-realtime" in final
+    assert "saaras:v4" in final
+    assert "\n" not in final
+
+
+def test_check_fails_naming_the_realtime_model_used_with_rest(
+    make_config, tmp_path, capsys, check_audio
+):
+    # load_config forces streaming on for this model, so only a hand-built
+    # Config (or a daemon older than the forcing rule) can reach this state.
+    config = make_config(model="saaras:v3-realtime", streaming=False)
+    status, out = run_check(config, tmp_path, capsys)
+
+    assert status == 1
+    assert "endpoint:     REST /speech-to-text" in out
+    final = result_line(out)
+    assert final.startswith("result:       FAILED (")
+    assert "model 'saaras:v3-realtime' cannot be used with REST /speech-to-text" in final
+    assert "saarika:v2.5" in final
+    assert "saaras:v3" in final
+
+
+def test_check_still_reports_the_other_problems_alongside_the_model_one(
+    make_config, tmp_path, capsys, check_audio
+):
+    config = make_config(api_key="", model="saaras:v3", streaming=True)
+    status, out = run_check(config, tmp_path, capsys)
+    final = result_line(out)
+    assert status == 1
+    assert "no API key" in final
+    assert "model 'saaras:v3' cannot be used with streaming" in final
+
+
+def test_check_problem_message_carries_no_http_text(make_config, tmp_path, capsys, check_audio):
+    config = make_config(model="saaras:v3-realtime", streaming=False)
+    _, out = run_check(config, tmp_path, capsys)
+    assert "HTTP" not in out
+    assert "400" not in result_line(out)

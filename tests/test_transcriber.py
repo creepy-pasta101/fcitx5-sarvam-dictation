@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from sarvam_dictation.config import DEFAULT_MODEL, REALTIME_MODEL, REST_MODELS
 from sarvam_dictation.transcriber import (
     SarvamTranscriber,
     TranscriptionError,
@@ -22,7 +23,7 @@ from sarvam_dictation.transcriber import (
     split_wav,
 )
 
-ALLOWED_CODES = {"no_api_key", "network", "api", "internal"}
+ALLOWED_CODES = {"no_api_key", "config_invalid", "network", "api", "internal"}
 
 
 # --------------------------------------------------------------------------
@@ -221,8 +222,14 @@ def test_missing_api_key_never_calls_an_injected_client(make_config, wav):
 
 
 def test_transcription_error_codes_are_from_the_documented_set():
-    assert ALLOWED_CODES == {"no_api_key", "network", "api", "internal"}
+    assert ALLOWED_CODES == {"no_api_key", "config_invalid", "network", "api", "internal"}
     assert issubclass(TranscriptionError, Exception)
+
+
+def test_config_invalid_is_a_transcription_error_code():
+    error = TranscriptionError("model 'x' cannot be sent to REST", code="config_invalid")
+    assert error.code == "config_invalid"
+    assert error.code in ALLOWED_CODES
 
 
 # --------------------------------------------------------------------------
@@ -405,8 +412,16 @@ def test_importing_the_module_does_not_import_the_sdk():
 
     import sarvam_dictation.transcriber as transcriber_module
 
-    importlib.reload(transcriber_module)
-    assert "sarvamai" not in sys.modules
+    # Reloading rebinds every name in the module, including the exception
+    # classes, so the module namespace is restored afterwards: a reloaded
+    # module would otherwise leave later tests holding stale class objects.
+    saved = dict(vars(transcriber_module))
+    try:
+        importlib.reload(transcriber_module)
+        assert "sarvamai" not in sys.modules
+    finally:
+        vars(transcriber_module).clear()
+        vars(transcriber_module).update(saved)
 
 
 def test_an_injected_client_never_triggers_the_sdk_import(make_config, wav):
@@ -414,3 +429,117 @@ def test_an_injected_client_never_triggers_the_sdk_import(make_config, wav):
         pytest.skip("sarvamai is installed and already imported in this interpreter")
     SarvamTranscriber(make_config(), client=FakeClient()).transcribe(wav(1.0))
     assert "sarvamai" not in sys.modules
+
+
+# --------------------------------------------------------------------------
+# the REST model namespace (brief 8)
+# --------------------------------------------------------------------------
+
+
+def test_the_realtime_model_is_not_a_rest_model():
+    assert REALTIME_MODEL not in REST_MODELS
+    assert DEFAULT_MODEL in REST_MODELS
+
+
+def test_a_realtime_only_model_raises_config_invalid_before_any_file_work(
+    make_config, tmp_path
+):
+    client = FakeClient()
+    transcriber = SarvamTranscriber(make_config(model=REALTIME_MODEL), client=client)
+    missing = tmp_path / "never-recorded.wav"
+
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(missing)
+
+    error = excinfo.value
+    assert error.code == "config_invalid"
+    # The guard runs before the file is even stat()ed: a path that does not
+    # exist still yields the model problem, not an "audio file ... does not
+    # exist" internal error.
+    assert "does not exist" not in str(error)
+    assert missing.exists() is False
+
+
+def test_a_realtime_only_model_never_calls_the_sdk(make_config, tmp_path):
+    client = FakeClient()
+    transcriber = SarvamTranscriber(make_config(model=REALTIME_MODEL), client=client)
+
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(tmp_path / "never-recorded.wav")
+
+    assert excinfo.value.code == "config_invalid"
+    assert client.calls == []
+    assert client.snapshots == []
+
+
+def test_a_realtime_only_model_never_constructs_a_client(make_config):
+    # No injected client: if the guard did not run first, _build_client would
+    # try to import the SDK (and fail with `internal` here, where it is not
+    # installed). `config_invalid` proves the SDK was never reached.
+    transcriber = SarvamTranscriber(make_config(model=REALTIME_MODEL))
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(Path("/nonexistent/audio.wav"))
+    assert excinfo.value.code == "config_invalid"
+
+
+def test_the_config_invalid_message_names_the_model_and_says_what_to_do(make_config):
+    transcriber = SarvamTranscriber(make_config(model=REALTIME_MODEL), client=FakeClient())
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(Path("/nonexistent/audio.wav"))
+
+    message = str(excinfo.value)
+    assert REALTIME_MODEL in message
+    assert "realtime" in message
+    assert "streaming = true" in message
+    assert DEFAULT_MODEL in message
+    # This error exists so the provider's HTTP 400 is never seen again.
+    assert "HTTP" not in message
+    assert "400" not in message
+    assert message.count(".") <= 2
+
+
+def test_an_unknown_model_is_refused_rather_than_replaced(make_config, tmp_path):
+    client = FakeClient()
+    transcriber = SarvamTranscriber(make_config(model="whisper-large"), client=client)
+
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(tmp_path / "never-recorded.wav")
+
+    assert excinfo.value.code == "config_invalid"
+    assert "whisper-large" in str(excinfo.value)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("model", REST_MODELS)
+def test_every_rest_model_is_sent_verbatim(make_config, fake_client, wav, model):
+    config = make_config(model=model, keyterms=())
+    transcript = SarvamTranscriber(config, client=fake_client).transcribe(wav(1.0))
+
+    assert len(fake_client.calls) == 1
+    assert fake_client.calls[0]["model"] == model
+    assert transcript.segments == 1
+
+
+@pytest.mark.parametrize("model", REST_MODELS)
+def test_no_rest_model_is_swapped_for_another(make_config, fake_client, wav, model):
+    config = make_config(model=model)
+    SarvamTranscriber(config, client=fake_client).transcribe(wav(1.0))
+    assert fake_client.calls[0]["model"] == config.model
+
+
+def test_the_model_is_checked_before_the_api_key(make_config, tmp_path):
+    # Both are wrong; the model is the one that decides which endpoint would be
+    # used, so it is reported first (brief 8 section 1b: "at the start").
+    config = make_config(api_key="", model=REALTIME_MODEL)
+    transcriber = SarvamTranscriber(config, client=FakeClient())
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(tmp_path / "never-recorded.wav")
+    assert excinfo.value.code == "config_invalid"
+
+
+def test_a_valid_rest_model_still_reports_a_missing_key(make_config, wav):
+    # The new guard must not have moved or weakened the existing one.
+    transcriber = SarvamTranscriber(make_config(api_key="", model="saaras:v3"))
+    with pytest.raises(TranscriptionError) as excinfo:
+        transcriber.transcribe(wav(1.0))
+    assert excinfo.value.code == "no_api_key"

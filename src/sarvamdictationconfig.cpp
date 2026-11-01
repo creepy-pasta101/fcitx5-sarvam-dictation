@@ -602,6 +602,12 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
     // partial = true: options that are absent from `raw` - the addon settings,
     // and any daemon key the file does not mention - keep their current value.
     config.load(raw, /*partial=*/true);
+
+    // The daemon forces streaming on for saaras:v3-realtime, so the page shows
+    // the state the daemon will actually be in instead of a stale toggle.
+    if (config.model.value() == DictationModel::SaarasV3Realtime) {
+        config.streaming.setValue(true);
+    }
     return true;
 }
 
@@ -650,8 +656,13 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
     document.set("api", "key", TomlValue::string(optionText(raw, kApiKey)));
     document.set("api", "model", TomlValue::string(optionText(raw, kModel)));
     document.set("api", "mode", TomlValue::string(optionText(raw, kMode)));
-    document.set("api", "streaming",
-                 TomlValue::boolean(optionBool(raw, kStreaming, false)));
+    // The daemon forces streaming on for saaras:v3-realtime whatever the
+    // Streaming toggle says, so the file must not claim otherwise: write the
+    // state the daemon will actually be in.
+    const bool streamingForFile =
+        optionBool(raw, kStreaming, false) ||
+        config.model.value() == DictationModel::SaarasV3Realtime;
+    document.set("api", "streaming", TomlValue::boolean(streamingForFile));
     document.set("api", "language_code",
                  TomlValue::string(languageCodeForFile(raw)));
     document.set("api", "keyterms", TomlValue::array(keytermsFromRaw(raw)));
