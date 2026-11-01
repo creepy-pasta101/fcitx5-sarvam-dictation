@@ -1,6 +1,6 @@
 # fcitx5-sarvam-dictation
 
-A dictation input method for Linux desktops. Press a hotkey anywhere — in a browser, a terminal, a chat window, an editor — speak in any of the 22 Indian languages Sarvam AI supports (or in English), press the hotkey again to stop, and the transcript is typed into whatever field currently has focus. If you would rather not press twice, a second hotkey works as push-to-talk: hold it down for as long as you speak and the release ends the recording. There is no separate dictation window and no copy-paste step: the text arrives as if you had typed it. The project is two pieces that work together: a small C++ addon for **Fcitx 5**, the input method framework, which owns the hotkey, the desktop notifications and the text insertion, and a Python daemon that owns audio capture and calls **Sarvam AI's Saaras speech-to-text model** over HTTPS. The addon never speaks HTTP and the daemon never touches fcitx5.
+A dictation input method for Linux desktops. Press a hotkey anywhere — in a browser, a terminal, a chat window, an editor — speak in any of the 22 Indian languages Sarvam AI supports (or in English), press the hotkey again to stop, and the transcript is typed into whatever field currently has focus. If you would rather not press twice, a second hotkey works as push-to-talk: hold it down for as long as you speak and the release ends the recording. There is no separate dictation window and no copy-paste step: the text arrives as if you had typed it. The project is two pieces that work together: a small C++ addon for **Fcitx 5**, the input method framework, which owns the hotkey, the desktop notifications and the text insertion, and a Python daemon that owns audio capture and calls **Sarvam AI's Saaras speech-to-text model** over HTTPS — or, when streaming is turned on, over a WebSocket that returns text while you are still speaking. The addon never speaks HTTP and the daemon never touches fcitx5.
 
 ## How it works
 
@@ -13,6 +13,7 @@ A dictation input method for Linux desktops. Press a hotkey anywhere — in a br
                                         audio capture (pw-record/parec/arecord)
                                                       |
                                         HTTPS -> api.sarvam.ai /speech-to-text
+                                        WSS   -> api.sarvam.ai /speech-to-text-realtime/ws
 ```
 
 The split exists because the addon lives inside fcitx5's event loop: any blocking call in it stalls keyboard input for every application on the desktop, so it must only do non-blocking socket reads and a string commit. The daemon, which is free to block, owns the messy parts — spawning and reaping an audio capture process, rewriting WAV headers, chunking long recordings, and waiting on a network request that can take seconds.
@@ -23,7 +24,7 @@ The wire protocol between the two is a frozen contract and is documented in [doc
 
 You need Fcitx 5 installed and running, a C++17 compiler with CMake 3.19 or newer, and the fcitx5 development headers so the addon can be built. On Debian and Ubuntu the headers come from `libfcitx5core-dev`, `libfcitx5config-dev`, `libfcitx5utils-dev` and `fcitx5-modules-dev`; on Fedora it is `fcitx5-devel`; on Arch the headers ship with the `fcitx5` package. Distribution package names vary between releases, so if one of these does not exist on your system, search your package manager for `fcitx5` development files — the build only needs `Fcitx5Core` and the `Notifications` module of `Fcitx5Module`.
 
-The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai).
+The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai). Dictation over the REST endpoint works with any valid key; the optional streaming mode additionally needs a subscription that includes realtime access.
 
 ## Install
 
@@ -121,7 +122,8 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 | Setting | `config.toml` key | Default | Meaning |
 |---|---|---|---|
 | Sarvam API key | `[api] key` | empty | Your Sarvam AI key. Empty means the daemon falls back to the `SARVAM_API_KEY` environment variable. |
-| Model | `[api] model` | `saaras:v4` | Speech-to-text model: `saaras:v4` (recommended) or `saaras:v3`. |
+| Model | `[api] model` | `saaras:v4` | Speech-to-text model: `saaras:v4` (recommended), `saaras:v3`, or `saaras:v3-realtime`, which transcribes as you speak and has no REST equivalent. |
+| Streaming | `[api] streaming` | `false` | Send audio to the realtime endpoint while you speak and show the partial text as it arrives, instead of transcribing the finished clip. Off by default. Needs a model that supports it (`saaras:v3-realtime` or `saaras:v4`) and a subscription that includes realtime access. |
 | Output mode | `[api] mode` | `transcribe` | What Saaras returns: `transcribe`, `translate`, `verbatim`, `translit` or `codemix`. |
 | Language | `[api] language_code` | empty | Spoken language. Empty means auto-detect, which is what the config page's *Auto-detect* entry writes; otherwise a code such as `hi-IN`, `bn-IN` or `ta-IN`. A hand-written `auto` is accepted too and treated as empty. |
 | Keyterms | `[api] keyterms` | `[]` | List of words and phrases to bias the model towards. `saaras:v4` only, at most 50 entries. |
@@ -164,6 +166,7 @@ model = "saaras:v4"
 mode = "transcribe"
 language_code = ""          # empty = auto-detect
 keyterms = []
+streaming = false
 
 [audio]
 device = ""
@@ -177,7 +180,7 @@ max_duration_s = 300
 
 ### Hand-editing and precedence
 
-Hand-editing `config.toml` still works, and it is what standalone and systemd users do: the daemon reads the file at startup and on every `reload`, and it does not care who wrote it. Any key in the file that the addon does not manage — your own comments and extra keys — is preserved when the addon saves, so a hand edit outside the ten settings above survives.
+Hand-editing `config.toml` still works, and it is what standalone and systemd users do: the daemon reads the file at startup and on every `reload`, and it does not care who wrote it. Any key in the file that the addon does not manage — your own comments and extra keys — is preserved when the addon saves, so a hand edit outside the eleven settings above survives.
 
 The precedence rule is worth being plain about: pressing *Apply* in `fcitx5-configtool` rewrites the keys the page manages, using the values currently on the page. The page fills itself from `config.toml` when the addon loads its configuration, so a hand edit made while fcitx5 is running is not reflected on the page and is overwritten by the next *Apply*. If you edit the file by hand while fcitx5 is running, make the edit in `fcitx5-configtool` as well, or reload and check the page before you press *Apply*.
 
@@ -194,6 +197,10 @@ The same command is useful when you want to confirm that the daemon accepts the 
 The key is stored in plain text in `config.toml`, which is why that file is mode `0600` and why the key never goes into `~/.config/fcitx5/conf/sarvamdictation.conf` — a second copy in a second file would be one more thing to leak and one more thing to keep in step. Keep the key out of version control: the file lives in your home directory, and if you keep dotfiles in git, add `sarvam-dictation/config.toml` to `.gitignore` rather than committing a real key. Never put a key in a repository, an issue, or a screenshot; in anything you share, use the placeholder `YOUR_SARVAM_API_KEY`.
 
 The key can also come from the `SARVAM_API_KEY` environment variable, which fills in only when the file's value is empty; an explicit key in the file is never shadowed by the environment.
+
+On the configuration page the key field does not show your key. When a key is stored the field shows `********` — eight asterisks — and when none is stored it is empty; the key itself stays in `config.toml` and is never put on the page. The field is write-only, and it behaves in the three ways that matter. Typing a new key into it replaces the stored one when you press *Apply*. Leaving `********` alone keeps the stored key exactly as it was, so opening the page and pressing *Apply* to change some other setting does not wipe your key. Clearing the field removes the key, after which the daemon falls back to `SARVAM_API_KEY` if that variable is set and otherwise reports `no_api_key` on the next recording.
+
+It is worth being plain about why the field works this way. `fcitx5-configtool` renders a string option as a plain `QLineEdit`, and it has no password widget at all: the option hints it understands are `Enum`, `EnumI18n`, `IntMin`, `IntMax` and `ListConstrain`, and none of them makes a text field echo dots instead of characters. A genuinely masked input therefore cannot be obtained from the addon side. What the addon does instead is keep the real key in `config.toml`, store the fixed sentinel `********` in the option so the page shows that rather than the key, and put the real value back when you save. The sentinel is never written to `config.toml`. The cost is that the field cannot reveal what is stored, only replace it: a key you have forgotten has to be replaced rather than looked up, and the field looks populated whenever a key exists even though it tells you nothing about which one.
 
 ## Usage
 
@@ -215,6 +222,10 @@ By default nothing is shown on screen while you dictate, with one exception: on 
 
 The output mode chooses what Saaras does with your speech. `transcribe` is the everyday choice: speech in, text in the same language's own script. `translate` returns the transcript in English, which is useful when you speak an Indian language but need English text. `verbatim` keeps the disfluencies and false starts rather than tidying them away, which is what you want for interview or meeting notes where the exact wording matters. `translit` returns romanised text instead of native script, useful for names, addresses and anything you will read back over a phone line. `codemix` is for speech that mixes languages inside a sentence, such as Hindi with English technical words, and preserves that mixture instead of forcing one language. Leave the language on *Auto-detect* to let the service detect it; set a code (for example `hi-IN`) when you know it, since detection on a short utterance is the most common source of a wrong-language transcript.
 
+Streaming is the other way to get the same text. With *Streaming* on — the `[api] streaming` key, off by default — the daemon sends your audio to Sarvam's realtime WebSocket endpoint while you are still speaking, and the partial transcript arrives as it is recognised: on KDE Plasma the recording indicator shows the words so far, so you can see that the microphone is open and roughly what has been heard. Release the key and the final transcript still arrives as one piece and is committed exactly as it is today. It is the same dictation, delivered sooner, and it is most useful with push-to-talk: you hold the key, watch the words appear, and let go when the sentence is done. The toggle key works with streaming too, but there is nothing on screen to watch while you think, so the gain is smaller.
+
+Two conditions come with it. Streaming needs a subscription that includes realtime access, so a key that transcribes fine over REST can still be refused by the realtime endpoint. It also needs a model that supports it: `saaras:v3-realtime` or `saaras:v4`. Choosing `saaras:v3-realtime` turns streaming on by itself, because that model has no REST equivalent; asking for streaming with any other model is a configuration error, and the daemon names both the option and the model when it rejects the file. Otherwise the REST path stays the default: with *Streaming* off, which is how the tool ships, nothing about the behaviour described here changes.
+
 The REST endpoint accepts audio up to about 30 seconds per request, so the daemon splits anything longer into 28-second chunks, transcribes them in order and joins the pieces with single spaces. You do not have to think about this: hold the hotkey session open for a two-minute thought and it works. The max recording length setting (default 300 seconds) stops the recording automatically at that length so a forgotten session cannot run forever.
 
 To check the daemon without involving fcitx5 at all, record from a terminal:
@@ -235,6 +246,7 @@ The helper speaks the same protocol as the addon and has one command per client 
 | `no_audio_device` error | No capture program was found, or the configured device does not exist. Install PipeWire or PulseAudio utilities so `pw-record` or `parec` is on `PATH`, or set the audio device to a real source. `sarvam-dictation-daemon --check` reports which backend it resolved. |
 | `audio_failed` error | The recorder produced zero-length or unreadable audio — usually a wrong audio device, or the capture process died immediately. Confirm the source works with `pw-record`/`parec`/`arecord` on the command line first. |
 | `401` or `api` error | The API key is missing, wrong, or out of quota. Check the Sarvam API key field on the configuration page (that is `[api] key` in `~/.config/sarvam-dictation/config.toml`) or `SARVAM_API_KEY`, and that the key is active on the dashboard. A key that was pasted with surrounding whitespace counts as wrong. |
+| Streaming fails while the REST path works | The realtime endpoint is a different service and needs a subscription that includes realtime access, so a key that transcribes over REST can still be refused there; the error code that comes back is `api`. Check the subscription on the dashboard, or turn *Streaming* off and keep using the REST path. A model other than `saaras:v3-realtime` or `saaras:v4` cannot stream at all, and `config_invalid` names both the option and the model if you try it. |
 | `no_api_key` error | Neither the config file nor the environment has a key. `sarvam-dictation-daemon --check` states plainly whether a key is present. |
 | `config_invalid` error | The daemon rejected the config file and kept its previous settings, so dictation still works. The message names the offending key; fix that value in `fcitx5-configtool` and press *Apply*, or correct the file and run `sarvam-dictation-ctl reload`. |
 | Settings on the page revert after you edit the file by hand | The page is filled from `config.toml` when fcitx5 loads the addon, and *Apply* rewrites the keys it manages. Make the change on the page, or reload fcitx5 before pressing *Apply*. |
@@ -261,7 +273,7 @@ The config file is read and written by a dependency-free TOML subset reader in `
 
 ## Privacy
 
-Your audio is uploaded to Sarvam AI's API to be transcribed. That is the whole point of the tool, and it means the audio leaves your machine and is handled under Sarvam's terms. Nothing else is retained: the daemon writes a temporary WAV in a temporary directory, transcribes it, and deletes it. There is no history, no database, no analytics, and no storage of transcripts by this project. The API key sits in one file, `~/.config/sarvam-dictation/config.toml`, readable only by you. If you would rather not send a given piece of audio to a remote service, do not dictate it.
+Your audio is uploaded to Sarvam AI's API to be transcribed. That is the whole point of the tool, and it means the audio leaves your machine and is handled under Sarvam's terms. Nothing else is retained: the daemon writes a temporary WAV in a temporary directory, transcribes it, and deletes it. With streaming on there is no temporary WAV at all — the audio is sent as it is captured, to the same service, and nothing is written to disk. There is no history, no database, no analytics, and no storage of transcripts by this project. The API key sits in one file, `~/.config/sarvam-dictation/config.toml`, readable only by you. If you would rather not send a given piece of audio to a remote service, do not dictate it.
 
 ## License
 

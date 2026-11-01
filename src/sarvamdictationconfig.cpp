@@ -16,11 +16,12 @@
  *   enum (FCITX_CONFIG_ENUM)   the stored name           the stored name
  *   std::vector<std::string>   children "0", "1" etc.    an array
  *
- * Only the last two rows need explicit conversion here; everything else is
- * handed to Configuration::load()/save() so the enum, integer and string rules
- * are fcitx5's, not a second copy of them. (No daemon-owned option is a bool,
- * so the "True"/"False" row never crosses this file; the addon's booleans stay
- * in the fcitx5 conf.)
+ * The enum, integer and string rows are handed to Configuration::load()/save()
+ * so those rules are fcitx5's, not a second copy of them. Two rows need explicit
+ * conversion here: the string list (array versus indexed children) and the bool,
+ * because `[api] streaming` is the one daemon-owned boolean -- TOML spells it
+ * true/false while RawConfig spells it "True"/"False". The addon's own booleans
+ * still live in the fcitx5 conf and never reach this file.
  *
  * Two behaviours of Configuration::load() drive the design:
  *
@@ -63,6 +64,7 @@ namespace {
 constexpr char kApiKey[] = "ApiKey";
 constexpr char kModel[] = "Model";
 constexpr char kMode[] = "Mode";
+constexpr char kStreaming[] = "Streaming";
 constexpr char kLanguageCode[] = "LanguageCode";
 constexpr char kKeyterms[] = "Keyterms";
 constexpr char kAudioDevice[] = "AudioDevice";
@@ -351,6 +353,23 @@ bool applyLanguageCode(const TomlDocument &document, RawConfig &raw,
 /// TOML array of strings -> the indexed children of a std::vector<std::string>
 /// option. An empty array still creates the node, so that the option really
 /// becomes empty instead of being left untouched.
+/// TOML boolean -> the "True"/"False" text fcitx5's RawConfig uses.
+bool applyBool(const TomlDocument &document, const char *section,
+               const char *key, const char *option, RawConfig &raw,
+               std::string *error) {
+    const TomlValue *value = document.get(section, key);
+    if (!value) {
+        return true;
+    }
+    if (value->type() != TomlType::Bool) {
+        setError(error, std::string(section) + "." + key +
+                            ": expected true or false");
+        return false;
+    }
+    raw.setValueByPath(option, value->asBool() ? "True" : "False");
+    return true;
+}
+
 bool applyKeyterms(const TomlDocument &document, RawConfig &raw,
                    std::string *error) {
     const TomlValue *value = document.get("api", "keyterms");
@@ -435,6 +454,15 @@ std::string optionText(const RawConfig &raw, const char *option) {
 std::string languageCodeForFile(const RawConfig &raw) {
     const std::string text = optionText(raw, kLanguageCode);
     return text == "auto" ? std::string() : text;
+}
+
+/// The RawConfig value of a boolean option, read back as a bool.
+bool optionBool(const RawConfig &raw, const char *option, bool fallback) {
+    const std::string *value = raw.valueByPath(option);
+    if (!value || value->empty()) {
+        return fallback;
+    }
+    return *value == "True";
 }
 
 /// The RawConfig value of an integer option, parsed back into a number.
@@ -558,6 +586,7 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
         !applyEnum<DictationModel>(document, "api", "model", kModel, raw,
                                    error) ||
         !applyEnum<DictationMode>(document, "api", "mode", kMode, raw, error) ||
+        !applyBool(document, "api", "streaming", kStreaming, raw, error) ||
         !applyLanguageCode(document, raw, error) ||
         !applyKeyterms(document, raw, error) ||
         !applyString(document, "audio", "device", kAudioDevice, raw, error) ||
@@ -621,6 +650,8 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
     document.set("api", "key", TomlValue::string(optionText(raw, kApiKey)));
     document.set("api", "model", TomlValue::string(optionText(raw, kModel)));
     document.set("api", "mode", TomlValue::string(optionText(raw, kMode)));
+    document.set("api", "streaming",
+                 TomlValue::boolean(optionBool(raw, kStreaming, false)));
     document.set("api", "language_code",
                  TomlValue::string(languageCodeForFile(raw)));
     document.set("api", "keyterms", TomlValue::array(keytermsFromRaw(raw)));
