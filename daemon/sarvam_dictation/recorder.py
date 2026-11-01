@@ -506,6 +506,14 @@ class StreamingRecorder:
     The graceful shutdown ladder is the one the file-based recorder uses:
     SIGINT, then SIGTERM, then SIGKILL. ``stop()`` is safe when ``start()`` was
     never called, and :meth:`chunks` ends when the child exits.
+
+    **The reader owns the pipe.** ``stop()`` terminates the child and leaves
+    any audio still buffered in the pipe - the tool's stdio buffer plus the
+    kernel pipe buffer - for whoever is reading :meth:`chunks`, because those
+    bytes are real speech that has not been sent yet. The drain task in
+    ``server.py`` is that reader: it feeds them to the transcriber, and
+    ``stop()`` must not compete with it. Only :meth:`cancel` sweeps the pipe
+    itself, because that path throws the recording away deliberately.
     """
 
     def __init__(self, config: Config) -> None:
@@ -575,8 +583,13 @@ class StreamingRecorder:
         """Stop capture gracefully and return the captured duration in ms.
 
         Uses the same SIGINT -> SIGTERM -> SIGKILL ladder as the file-based
-        recorder, then sweeps whatever the tool had already buffered. Safe to
-        call when ``start()`` was never called (returns 0).
+        recorder, and deliberately does **not** drain the pipe: whatever the
+        tool had already buffered is real audio that has not been sent yet, and
+        the drain task in ``server.py`` reads it out of :meth:`chunks` and
+        feeds it to the transcriber. Draining here would swallow that tail and
+        the final transcript would come back missing the last words.
+
+        Safe to call when ``start()`` was never called (returns 0).
         """
         proc = self._proc
         self._proc = None
@@ -585,9 +598,13 @@ class StreamingRecorder:
 
         try:
             await self._terminate(proc)
-            # Reading to EOF is also what lets asyncio close the pipe, so the
-            # child can be reaped below.
-            await self._drain(proc)
+            # No _drain(proc) here on purpose. The bytes still sitting in the
+            # pipe are audio that has not reached the endpoint: _drain() would
+            # read them to EOF and throw them away, and the drain task in
+            # server.py would then find an empty pipe and feed nothing. The
+            # child is dead by now, so the pipe reaches EOF as soon as that
+            # reader has consumed the buffer, and _reap (bounded by
+            # STREAM_REAP_TIMEOUT_S, and tolerant of a timeout) returns.
             await self._reap(proc)
         finally:
             logger.debug("captured %d ms of streaming audio", self.duration_ms)
@@ -602,6 +619,9 @@ class StreamingRecorder:
             return
         try:
             await self._terminate(proc)
+            # Unlike stop(), this path discards deliberately: nothing is going
+            # to be transcribed, so sweeping the pipe here costs nothing and
+            # lets the child be reaped promptly.
             await self._drain(proc)
             await self._reap(proc)
         except OSError as exc:  # pragma: no cover - signal races only

@@ -4,15 +4,22 @@
 is replaced by :class:`FakeProcess`, which writes a real (tiny) WAV file so the
 duration arithmetic and the header-finalising shutdown ladder are exercised for
 real. Every path used is inside ``tmp_path``.
+
+The streaming tail tests at the end of this module are different: they spawn a
+**real child process** with ``sys.executable -c`` and read the bytes it writes
+to its stdout. A fake pipe would not have caught the bug they guard - the bytes
+buffered in a real pipe are what ``StreamingRecorder.stop()`` used to swallow.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import wave
 from pathlib import Path
@@ -646,9 +653,10 @@ def test_streaming_passes_stdout_pipe_and_devnull_stdin(
     assert process.argv[0] == "pw-record"
 
 
-def test_streaming_duration_counts_audio_drained_at_stop(
+def test_streaming_stop_does_not_count_audio_it_did_not_read(
     config, all_binaries, stream_popen, fast_ladder
 ):
+    """``stop()`` must leave the buffered tail to the reader, not swallow it."""
     stream_popen(chunks=(b"\x00\x00" * 4000, b"\x00\x00" * 4000))
 
     async def scenario():
@@ -660,8 +668,10 @@ def test_streaming_duration_counts_audio_drained_at_stop(
 
     first_len, duration = asyncio.run(scenario())
     assert first_len == 8000
-    # The stop-time drain sweeps the second chunk too: 16000 bytes = 500 ms.
-    assert abs(duration - 500) <= 1
+    # Only the 8000 bytes the reader actually took are counted: 250 ms. The
+    # second chunk is still in the pipe, waiting for the drain task in
+    # server.py, and the duration is read again after that task has run.
+    assert abs(duration - 250) <= 1
 
 
 # -- shutdown ladder -------------------------------------------------------
@@ -726,3 +736,172 @@ def test_streaming_cancel_before_start_is_a_no_op(config):
         await recorder.cancel()
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------
+# StreamingRecorder against a REAL child process: the tail must survive stop()
+# --------------------------------------------------------------------------
+#
+# The bug these tests guard lives in the pipe, so a fake pipe cannot catch it:
+# the bytes a capture tool has already handed to the kernel are the audio the
+# user just spoke, and ``stop()`` used to read them out and throw them away.
+
+#: Exactly what the child writes: 24576 bytes of s16le mono at 16 kHz, which
+#: is 768 ms of audio, six 4096-byte reads, and small enough to sit entirely in
+#: one kernel pipe buffer (64 KiB) so the child never blocks on its write.
+STREAM_PATTERN = bytes(range(256)) * 96
+
+#: Child A: write the pattern in two flushes, then exit. Models a capture tool
+#: that finishes on its own.
+CHILD_WRITES_THEN_EXITS = """
+import base64
+import sys
+
+data = base64.b64decode(sys.argv[1])
+half = len(data) // 2
+out = sys.stdout.buffer
+out.write(data[:half])
+out.flush()
+out.write(data[half:])
+out.flush()
+"""
+
+#: Child B: write the pattern, touch a sentinel so the parent knows every byte
+#: is in the pipe, then keep running like a live capture tool. Models the real
+#: shape of the bug: the user stops speaking while the reader is mid-stream.
+CHILD_WRITES_THEN_WAITS = """
+import base64
+import pathlib
+import sys
+import time
+
+data = base64.b64decode(sys.argv[1])
+half = len(data) // 2
+out = sys.stdout.buffer
+out.write(data[:half])
+out.flush()
+out.write(data[half:])
+out.flush()
+pathlib.Path(sys.argv[2]).touch()
+time.sleep(30)
+"""
+
+
+@pytest.fixture
+def real_child(monkeypatch, tmp_path):
+    """Point ``StreamingRecorder`` at a real ``sys.executable -c`` child.
+
+    ``_stream_command`` and ``detect_backend`` are the only things patched, so
+    the recorder spawns, reads, signals and reaps a genuine OS process through
+    the ordinary asyncio subprocess machinery.
+    """
+
+    def _install(source, *, wait_for_ready=False):
+        argv = [sys.executable, "-c", source, base64.b64encode(STREAM_PATTERN).decode("ascii")]
+        ready = None
+        if wait_for_ready:
+            ready = tmp_path / "child-ready"
+            argv.append(str(ready))
+        monkeypatch.setattr(
+            recorder_mod, "_stream_command", lambda backend, config: list(argv)
+        )
+        monkeypatch.setattr(
+            recorder_mod, "detect_backend", lambda preferred="auto": "pipewire"
+        )
+        return ready
+
+    return _install
+
+
+async def wait_for_ready(path, timeout=10.0):
+    """Wait until the child has flushed every byte into the pipe."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not path.exists():
+        if loop.time() >= deadline:
+            raise AssertionError(f"the child never signalled readiness via {path}")
+        await asyncio.sleep(0.01)
+
+
+def test_streaming_real_child_tail_survives_a_stop_after_the_iteration(config, real_child):
+    """Collect every chunk, then stop: the bytes must equal the pattern exactly."""
+    real_child(CHILD_WRITES_THEN_EXITS)
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        try:
+            captured = b"".join(await collect(recorder))
+            duration = await recorder.stop()
+            return captured, duration
+        finally:
+            await recorder.cancel()
+
+    captured, duration = asyncio.run(scenario())
+    assert len(STREAM_PATTERN) == 24576
+    assert captured == STREAM_PATTERN
+    assert abs(duration - 768) <= 1
+
+
+def test_streaming_real_child_tail_survives_a_stop_mid_stream(
+    config, real_child, monkeypatch
+):
+    """Stop before EOF, keep iterating: the buffered tail must still arrive."""
+    # The pipe is deliberately still full when stop() runs, so asyncio's
+    # Process.wait() cannot resolve; _reap must tolerate that without waiting
+    # out the production grace period in a test.
+    monkeypatch.setattr(recorder_mod, "STREAM_REAP_TIMEOUT_S", 0.25)
+    ready = real_child(CHILD_WRITES_THEN_WAITS, wait_for_ready=True)
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        try:
+            await wait_for_ready(ready)
+            stream = recorder.chunks()
+            first = await stream.__anext__()
+            # The user stopped speaking while the reader was mid-stream: the
+            # child is still alive and most of the audio is still in the pipe.
+            await recorder.stop()
+            rest = [chunk async for chunk in stream]
+            return first, b"".join(rest), recorder.duration_ms
+        finally:
+            await recorder.cancel()
+
+    first, rest, duration = asyncio.run(scenario())
+    assert 0 < len(first) <= recorder_mod.STREAM_CHUNK_SIZE
+    assert len(first) < len(STREAM_PATTERN), "the child must still owe the reader bytes"
+    assert first + rest == STREAM_PATTERN
+    # The reader counted every byte it delivered, so the duration is final
+    # only after it has finished - which is what server.py now reads.
+    assert abs(duration - 768) <= 1
+
+
+def test_streaming_real_child_cancel_still_discards_the_tail(config, real_child):
+    """cancel() is the one path that throws the recording away on purpose."""
+    ready = real_child(CHILD_WRITES_THEN_WAITS, wait_for_ready=True)
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        await wait_for_ready(ready)
+        stream = recorder.chunks()
+        first = await stream.__anext__()
+        await recorder.cancel()
+        await recorder.cancel()
+        return first, [chunk async for chunk in stream]
+
+    first, rest = asyncio.run(scenario())
+    assert 0 < len(first) <= recorder_mod.STREAM_CHUNK_SIZE
+    assert rest == [], "cancel() must drain and discard, never hand the tail on"
+
+
+def test_streaming_real_child_stop_without_start_is_safe(config, real_child):
+    """stop() before start() returns 0 and never spawns anything."""
+    real_child(CHILD_WRITES_THEN_EXITS)
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        return await recorder.stop(), await recorder.stop(), recorder.duration_ms
+
+    assert asyncio.run(scenario()) == (0, 0, 0)

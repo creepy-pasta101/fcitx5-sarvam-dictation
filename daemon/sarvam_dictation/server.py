@@ -753,6 +753,10 @@ class DictationServer:
             # Capture has ended, so the drain task ends too; let it hand over
             # every remaining byte before the session is finished.
             await self._finish_drain(job)
+            # The tail is in now, so the duration is only final at this point:
+            # stop() no longer drains the pipe, and the reader that did counts
+            # its bytes into the same recorder.
+            duration_ms = int(getattr(job.recorder, "duration_ms", duration_ms))
             # The drain task records its own failure; read it again now that it
             # has ended, so a failure raised while capture was stopping is not
             # lost.
