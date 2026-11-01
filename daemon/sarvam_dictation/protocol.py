@@ -5,6 +5,10 @@ line, UTF-8, ``\\n`` terminated, every message carries ``"v": 1``.
 
 This module is deliberately free of I/O and of asyncio so that both the daemon
 and the test-suite can exercise framing in isolation.
+
+Brief 7 adds exactly one message and no command: ``partial``, the interim
+transcript of a streaming recording, sent to the owner only and never a
+substitute for ``result``.
 """
 
 from __future__ import annotations
@@ -115,6 +119,19 @@ def result_msg(
         "duration_ms": int(duration_ms),
         "segments": int(segments),
     }
+
+
+def partial_msg(msg_id: str, text: str) -> dict:
+    """Build a ``partial`` message carrying interim text of a live recording.
+
+    Sent to the owner of the recording only, at most about ten times a second,
+    while a streaming transcription is running. ``text`` is the latest partial
+    for the whole recording so far, already stripped, and ``msg_id`` is the id
+    of the ``start`` command that began the recording, so a client can match
+    it. It never replaces ``result``: the final transcript still arrives as a
+    ``result`` carrying the ``stop`` id.
+    """
+    return {"v": VERSION, "type": "partial", "id": msg_id, "text": text}
 
 
 def pong_msg() -> dict:

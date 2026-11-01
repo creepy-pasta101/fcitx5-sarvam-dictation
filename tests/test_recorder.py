@@ -8,6 +8,7 @@ real. Every path used is inside ``tmp_path``.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import shutil
 import signal
@@ -23,6 +24,7 @@ from sarvam_dictation.recorder import (
     Recorder,
     RecorderError,
     Recording,
+    StreamingRecorder,
     detect_backend,
     normalize_wav,
     wav_duration_ms,
@@ -384,3 +386,343 @@ def test_stop_escalates_sigint_then_sigterm_then_sigkill(config, tmp_path, all_b
     process = FakeProcess.last_instance
     assert process.signals == [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
     assert len(process.wait_calls) >= 2, "the ladder must wait between escalating signals"
+
+
+# --------------------------------------------------------------------------
+# StreamingRecorder: raw PCM on stdout
+# --------------------------------------------------------------------------
+
+
+class FakeStreamStdout:
+    """A pipe reader that hands out scripted chunks, then EOF (``b""``)."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.closed = False
+        self.reads = 0
+
+    async def read(self, size=-1):
+        self.reads += 1
+        if self.closed:
+            raise ValueError("I/O operation on closed pipe")
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+
+class FakeStreamProcess:
+    """Stand-in for ``asyncio.subprocess.Process`` writing raw PCM to stdout."""
+
+    last_instance: "FakeStreamProcess | None" = None
+
+    def __init__(self, chunks=(), ignore_signals=frozenset()):
+        self.stdout = FakeStreamStdout(chunks)
+        self.pid = 5151
+        self.returncode = None
+        self.signals = []
+        self.wait_calls = []
+        self.argv = []
+        self.kwargs = {}
+        self._ignore = set(ignore_signals)
+        self._done = asyncio.Event()
+        FakeStreamProcess.last_instance = self
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        if sig == signal.SIGKILL or sig not in self._ignore:
+            # Capture tools exit 0 on SIGINT; harsher signals leave a negative code.
+            self.returncode = 0 if sig == signal.SIGINT else -int(sig)
+            self._done.set()
+
+    def kill(self):
+        self.send_signal(signal.SIGKILL)
+
+    def poll(self):
+        return self.returncode
+
+    async def wait(self):
+        self.wait_calls.append(None)
+        await self._done.wait()
+        return self.returncode
+
+
+@pytest.fixture
+def stream_popen(monkeypatch):
+    """Patch ``asyncio.create_subprocess_exec`` with a fake capture tool."""
+
+    def _install(*, chunks=(b"\x00\x01" * 1600,), ignore_signals=frozenset()):
+        async def fake_exec(*args, **kwargs):
+            process = FakeStreamProcess(chunks=chunks, ignore_signals=ignore_signals)
+            process.argv = list(args)
+            process.kwargs = kwargs
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        return fake_exec
+
+    return _install
+
+
+@pytest.fixture
+def fast_ladder(monkeypatch):
+    """Make the shutdown ladder's grace periods instantaneous."""
+    monkeypatch.setattr(recorder_mod, "SIGINT_GRACE_S", 0.05)
+    monkeypatch.setattr(recorder_mod, "SIGTERM_GRACE_S", 0.05)
+    monkeypatch.setattr(recorder_mod, "SIGKILL_GRACE_S", 0.05)
+
+
+async def collect(recorder):
+    """Drain ``chunks()`` into a list."""
+    return [chunk async for chunk in recorder.chunks()]
+
+
+# -- argv ------------------------------------------------------------------
+
+
+def test_stream_command_writes_raw_pcm_to_stdout(config):
+    argv = recorder_mod._stream_command("pipewire", config)
+    assert argv[0] == "pw-record"
+    assert argv[argv.index("--format") + 1] == "s16"
+    assert argv[argv.index("--channels") + 1] == "1"
+    assert argv[argv.index("--rate") + 1] == "16000"
+    assert argv[-1] == "-"
+    assert not any(arg.endswith(".wav") for arg in argv)
+
+
+def test_stream_command_for_pulse_is_raw_and_unredirected(config):
+    argv = recorder_mod._stream_command("pulse", config)
+    assert argv[0] == "parec"
+    assert "--format=s16le" in argv
+    assert "--rate=16000" in argv
+    assert "--channels=1" in argv
+    assert "--raw" in argv
+    assert not any(arg.endswith(".wav") for arg in argv)
+    assert not any(arg.startswith("--file-format") for arg in argv)
+
+
+def test_stream_command_for_alsa_is_raw_on_stdout(config):
+    argv = recorder_mod._stream_command("alsa", config)
+    assert argv[0] == "arecord"
+    assert argv[argv.index("-f") + 1] == "S16_LE"
+    assert argv[argv.index("-t") + 1] == "raw"
+    assert argv[-1] == "-"
+
+
+def test_stream_command_honours_the_configured_device(make_config):
+    config = make_config(audio_device="alsa_input.usb")
+    assert "--target" in recorder_mod._stream_command("pipewire", config)
+    assert "--device=alsa_input.usb" in recorder_mod._stream_command("pulse", config)
+    alsa = recorder_mod._stream_command("alsa", config)
+    assert alsa[alsa.index("-D") + 1] == "alsa_input.usb"
+
+
+def test_stream_command_rejects_an_unknown_backend(config):
+    with pytest.raises(RecorderError) as excinfo:
+        recorder_mod._stream_command("oss", config)
+    assert excinfo.value.code == "no_audio_device"
+
+
+# -- lifecycle -------------------------------------------------------------
+
+
+def test_streaming_start_then_stop_returns_a_plausible_duration(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    # 16000 bytes of s16le mono at 16 kHz is 0.5 s of audio.
+    stream_popen(chunks=(b"\x00\x00" * 8000,))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        captured = await collect(recorder)
+        duration = await recorder.stop()
+        return captured, duration
+
+    captured, duration = asyncio.run(scenario())
+    assert sum(len(chunk) for chunk in captured) == 16000
+    assert abs(duration - 500) <= 1
+
+
+def test_streaming_chunks_end_when_the_child_exits(config, all_binaries, stream_popen, fast_ladder):
+    stream_popen(chunks=(b"\x00\x00" * 100, b"\x00\x00" * 50))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        return await collect(recorder)
+
+    captured = asyncio.run(scenario())
+    assert len(captured) == 2
+    assert [len(chunk) for chunk in captured] == [200, 100]
+
+
+def test_streaming_chunks_stop_when_the_pipe_closes(config, all_binaries, stream_popen, fast_ladder):
+    stream_popen(chunks=(b"\x00\x00" * 100,))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        FakeStreamProcess.last_instance.stdout.closed = True
+        return await collect(recorder)
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_streaming_chunks_before_start_is_empty(config):
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        return await collect(recorder)
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_streaming_stop_without_start_is_safe(config):
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        return await recorder.stop()
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_streaming_start_without_a_tool_raises_no_audio_device(config, which, fast_ladder):
+    which(set())
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+
+    with pytest.raises(RecorderError) as excinfo:
+        asyncio.run(scenario())
+    assert excinfo.value.code == "no_audio_device"
+
+
+def test_streaming_start_maps_a_spawn_failure_to_no_audio_device(
+    config, all_binaries, monkeypatch, fast_ladder
+):
+    async def boom(*args, **kwargs):
+        raise OSError("no such file or directory")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+
+    with pytest.raises(RecorderError) as excinfo:
+        asyncio.run(scenario())
+    assert excinfo.value.code == "no_audio_device"
+
+
+def test_streaming_start_twice_raises_audio_failed(config, all_binaries, stream_popen, fast_ladder):
+    stream_popen()
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        try:
+            await recorder.start()
+        finally:
+            await recorder.cancel()
+
+    with pytest.raises(RecorderError) as excinfo:
+        asyncio.run(scenario())
+    assert excinfo.value.code == "audio_failed"
+
+
+def test_streaming_passes_stdout_pipe_and_devnull_stdin(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    stream_popen()
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        await recorder.cancel()
+
+    asyncio.run(scenario())
+    process = FakeStreamProcess.last_instance
+    assert process.kwargs["stdout"] == asyncio.subprocess.PIPE
+    assert process.kwargs["stdin"] == asyncio.subprocess.DEVNULL
+    assert process.argv[0] == "pw-record"
+
+
+def test_streaming_duration_counts_audio_drained_at_stop(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    stream_popen(chunks=(b"\x00\x00" * 4000, b"\x00\x00" * 4000))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        first = await recorder.chunks().__anext__()
+        duration = await recorder.stop()
+        return len(first), duration
+
+    first_len, duration = asyncio.run(scenario())
+    assert first_len == 8000
+    # The stop-time drain sweeps the second chunk too: 16000 bytes = 500 ms.
+    assert abs(duration - 500) <= 1
+
+
+# -- shutdown ladder -------------------------------------------------------
+
+
+def test_streaming_stop_sends_sigint_first_and_not_sigkill(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    stream_popen()
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        await recorder.stop()
+
+    asyncio.run(scenario())
+    process = FakeStreamProcess.last_instance
+    assert process.signals, "stop() must signal the capture process"
+    assert process.signals[0] == signal.SIGINT
+    assert signal.SIGKILL not in process.signals
+
+
+def test_streaming_stop_escalates_sigint_then_sigterm_then_sigkill(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    stream_popen(ignore_signals=frozenset({signal.SIGINT, signal.SIGTERM}))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        started = time.monotonic()
+        await recorder.stop()
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(scenario())
+    process = FakeStreamProcess.last_instance
+    assert process.signals == [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
+    # Each escalation must have waited out its grace period first (2 x 0.05 s).
+    assert elapsed >= 0.09, "the ladder must wait between escalating signals"
+
+
+def test_streaming_cancel_is_idempotent_and_discards_the_audio(
+    config, all_binaries, stream_popen, fast_ladder
+):
+    stream_popen(chunks=(b"\x00\x00" * 8000,))
+
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.start()
+        await collect(recorder)
+        await recorder.cancel()
+        await recorder.cancel()
+        return await recorder.stop()
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_streaming_cancel_before_start_is_a_no_op(config):
+    async def scenario():
+        recorder = StreamingRecorder(config)
+        await recorder.cancel()
+        await recorder.cancel()
+
+    asyncio.run(scenario())
