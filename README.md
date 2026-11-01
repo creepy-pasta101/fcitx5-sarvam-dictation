@@ -122,7 +122,7 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 | Setting | `config.toml` key | Default | Meaning |
 |---|---|---|---|
 | Sarvam API key | `[api] key` | empty | Your Sarvam AI key. Empty means the daemon falls back to the `SARVAM_API_KEY` environment variable. |
-| Model | `[api] model` | `saaras:v4` | Speech-to-text model: `saaras:v4` (recommended), `saaras:v3`, or `saaras:v3-realtime`, which transcribes as you speak and has no REST equivalent. |
+| Model | `[api] model` | `saaras:v4` | Speech-to-text model: `saaras:v4` (recommended), `saaras:v3`, or `saaras:v3-realtime`, which transcribes as you speak and has no REST equivalent. Picking `saaras:v3-realtime` turns streaming on by itself, and `config.toml` will show `streaming = true` after *Apply*, whatever the *Streaming* toggle says. |
 | Streaming | `[api] streaming` | `false` | Send audio to the realtime endpoint while you speak and show the partial text as it arrives, instead of transcribing the finished clip. Off by default. Needs a model that supports it (`saaras:v3-realtime` or `saaras:v4`) and a subscription that includes realtime access. |
 | Output mode | `[api] mode` | `transcribe` | What Saaras returns: `transcribe`, `translate`, `verbatim`, `translit` or `codemix`. |
 | Language | `[api] language_code` | empty | Spoken language. Empty means auto-detect, which is what the config page's *Auto-detect* entry writes; otherwise a code such as `hi-IN`, `bn-IN` or `ta-IN`. A hand-written `auto` is accepted too and treated as empty. |
@@ -132,6 +132,20 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 | Capture backend | `[audio] backend` | `auto` | Which capture program to use: `auto`, `pipewire` (`pw-record`), `pulse` (`parec`) or `alsa` (`arecord`). |
 | Socket path | `[server] socket_path` | empty | Path to the daemon socket. Empty means the default rule (`$XDG_RUNTIME_DIR/sarvam-dictation.sock`, else `/tmp/sarvam-dictation-<uid>.sock`). |
 | Max recording length (seconds) | `[server] max_duration_s` | `300` | Auto-stop and transcribe at this length. Accepts 5 to 3600. |
+
+### Model namespaces
+
+The three endpoints the SDK can reach do not share a model list. Each one has its own namespace, and a name that is valid on one is not valid on the others.
+
+| SDK client | Transport | Accepted models |
+|---|---|---|
+| `client.speech_to_text` | REST `POST /speech-to-text` | `saarika:v2.5`, `saaras:v3`, `saaras:v4` |
+| `client.speech_to_text_streaming` | WebSocket `/speech-to-text/ws` (legacy) | `saaras:v3`, `saaras:v4` |
+| `client.speech_to_text_realtime_streaming` | WebSocket `/speech-to-text-realtime/ws` | `saaras:v3-realtime`, `saaras:v4` |
+
+The SDK exposes these as three separate clients, with three separate model lists, and the lists are not interchangeable. `saaras:v3-realtime` exists only on the realtime endpoint and is not a REST model at all, so a request that carries it to `POST /speech-to-text` is refused by the provider with a 400. `saaras:v4` is the one model that works everywhere: it is the only name all three endpoints accept, which is why it is the default. The daemon uses two of the three clients — the REST client for the ordinary path, the realtime client when streaming is on — and checks the configured model against the list of the endpoint it is about to use before any request is made.
+
+The configuration page offers the three Saaras models. `saarika:v2.5` is accepted by the REST endpoint but is not one of the choices on the page.
 
 ### Addon settings
 
@@ -224,7 +238,7 @@ The output mode chooses what Saaras does with your speech. `transcribe` is the e
 
 Streaming is the other way to get the same text. With *Streaming* on — the `[api] streaming` key, off by default — the daemon sends your audio to Sarvam's realtime WebSocket endpoint while you are still speaking, and the partial transcript arrives as it is recognised: on KDE Plasma the recording indicator shows the words so far, so you can see that the microphone is open and roughly what has been heard. Release the key and the final transcript still arrives as one piece and is committed exactly as it is today. It is the same dictation, delivered sooner, and it is most useful with push-to-talk: you hold the key, watch the words appear, and let go when the sentence is done. The toggle key works with streaming too, but there is nothing on screen to watch while you think, so the gain is smaller.
 
-Two conditions come with it. Streaming needs a subscription that includes realtime access, so a key that transcribes fine over REST can still be refused by the realtime endpoint. It also needs a model that supports it: `saaras:v3-realtime` or `saaras:v4`. Choosing `saaras:v3-realtime` turns streaming on by itself, because that model has no REST equivalent; asking for streaming with any other model is a configuration error, and the daemon names both the option and the model when it rejects the file. Otherwise the REST path stays the default: with *Streaming* off, which is how the tool ships, nothing about the behaviour described here changes.
+Two conditions come with it. Streaming needs a subscription that includes realtime access, so a key that transcribes fine over REST can still be refused by the realtime endpoint. It also needs a model that supports it: `saaras:v3-realtime` or `saaras:v4`. Choosing `saaras:v3-realtime` turns streaming on by itself, because that model has no REST equivalent, and `config.toml` will show `streaming = true` after you press *Apply*: the addon writes the state the daemon will actually be in rather than the position of the *Streaming* toggle, and it turns the toggle on when it loads such a file, so the page and the file agree. Asking for streaming with a model outside those two is a configuration error, and the daemon names both the option and the model when it rejects the file. Otherwise the REST path stays the default: with *Streaming* off, which is how the tool ships, nothing about the behaviour described here changes.
 
 The REST endpoint accepts audio up to about 30 seconds per request, so the daemon splits anything longer into 28-second chunks, transcribes them in order and joins the pieces with single spaces. You do not have to think about this: hold the hotkey session open for a two-minute thought and it works. The max recording length setting (default 300 seconds) stops the recording automatically at that length so a forgotten session cannot run forever.
 
@@ -247,8 +261,9 @@ The helper speaks the same protocol as the addon and has one command per client 
 | `audio_failed` error | The recorder produced zero-length or unreadable audio — usually a wrong audio device, or the capture process died immediately. Confirm the source works with `pw-record`/`parec`/`arecord` on the command line first. |
 | `401` or `api` error | The API key is missing, wrong, or out of quota. Check the Sarvam API key field on the configuration page (that is `[api] key` in `~/.config/sarvam-dictation/config.toml`) or `SARVAM_API_KEY`, and that the key is active on the dashboard. A key that was pasted with surrounding whitespace counts as wrong. |
 | Streaming fails while the REST path works | The realtime endpoint is a different service and needs a subscription that includes realtime access, so a key that transcribes over REST can still be refused there; the error code that comes back is `api`. Check the subscription on the dashboard, or turn *Streaming* off and keep using the REST path. A model other than `saaras:v3-realtime` or `saaras:v4` cannot stream at all, and `config_invalid` names both the option and the model if you try it. |
+| `400` saying `Invalid model 'saaras:v3-realtime'` | The daemon in use is older than the streaming support, or was installed separately from the addon, so it sends the realtime model to the REST endpoint, which never accepts it. Reinstall so that both halves match, and run `sarvam-dictation-daemon --check`, which now prints the endpoint that will be used and flags a model that does not belong to it. |
 | `no_api_key` error | Neither the config file nor the environment has a key. `sarvam-dictation-daemon --check` states plainly whether a key is present. |
-| `config_invalid` error | The daemon rejected the config file and kept its previous settings, so dictation still works. The message names the offending key; fix that value in `fcitx5-configtool` and press *Apply*, or correct the file and run `sarvam-dictation-ctl reload`. |
+| `config_invalid` error | The daemon rejected the config file and kept its previous settings, so dictation still works. The message names the offending key; fix that value in `fcitx5-configtool` and press *Apply*, or correct the file and run `sarvam-dictation-ctl reload`. The same code is returned at recording time when the chosen model cannot be used with the endpoint the daemon is about to use; the message then names the model and says what to change. |
 | Settings on the page revert after you edit the file by hand | The page is filled from `config.toml` when fcitx5 loads the addon, and *Apply* rewrites the keys it manages. Make the change on the page, or reload fcitx5 before pressing *Apply*. |
 | Empty transcript, nothing inserted | The daemon transcribed silence or noise and returned an empty string, which is a legal result and commits nothing. Check the microphone is not muted and that the audio device points at it; raise your input level and try a longer utterance. |
 | Text is transcribed but does not appear in the application | The application may not be using fcitx5 at all. Electron and some GTK applications only get text committed through fcitx5's own frontend: make sure the app is running under Wayland with `GTK_IM_MODULE=fcitx`/`QT_IM_MODULE=fcitx`, or under X11 with `XMODIFIERS=@im=fcitx`, and that fcitx5's Wayland or X11 frontend is the one the app connects to. Also check whether the window that had focus was closed while transcribing — the transcript then goes to the clipboard and the recording indicator says so, rather than being typed into another window. |
@@ -257,7 +272,7 @@ The helper speaks the same protocol as the addon and has one command per client 
 | A short push-to-talk tap records nothing | A hold shorter than 250 ms is treated as an accidental tap and the recording is cancelled, so nothing is transcribed. Hold the key for longer. Losing window focus during the hold also ends the recording early. |
 | Need to see what happened | Daemon logs go to the journal when it runs as a service: `journalctl --user -u sarvam-dictation -f`. For a foreground daemon, raise the level with `sarvam-dictation-daemon --log-level debug`. For the addon, restart fcitx5 in verbose mode with `fcitx5 -rd --verbose`. |
 
-`sarvam-dictation-daemon --check` is the single most useful diagnostic: it validates the config file, reports the resolved audio backend and device, says whether an API key is present, and exits non-zero if something is wrong.
+`sarvam-dictation-daemon --check` is the single most useful diagnostic: it validates the config file, reports the resolved audio backend and device, says whether an API key is present, prints the endpoint the daemon will use, and exits non-zero if something is wrong — including a model that does not belong to that endpoint.
 
 ## Development
 
