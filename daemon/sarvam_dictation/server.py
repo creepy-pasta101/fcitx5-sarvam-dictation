@@ -25,6 +25,12 @@ again to finish). Both land in :meth:`DictationServer._cmd_start`, which is
 told which one it is by its ``push_to_talk`` argument and picks
 ``config.streaming_push_to_talk`` or ``config.streaming_toggle`` accordingly.
 No protocol field is added; the command name is the mode.
+
+Brief 16 gives the streaming drain its own, much larger bound. The task that
+feeds captured audio into the realtime socket is awaited for
+``STREAM_DRAIN_TIMEOUT`` and is never cancelled when that expires, because
+cancelling it destroys speech rather than merely delaying a result;
+``DRAIN_TIMEOUT`` stays what it always was, the bound on a client-socket write.
 """
 
 from __future__ import annotations
@@ -59,7 +65,18 @@ from .transcriber import SarvamTranscriber, TranscriptionError
 logger = logging.getLogger(__name__)
 
 READ_CHUNK = 64 * 1024
+
+#: How long a write to a client's socket may block before that client is
+#: considered stuck and dropped. This bounds a *delivery* to a client, where the
+#: only thing at stake is a late message.
 DRAIN_TIMEOUT = 5.0
+
+#: How long the streaming drain may take to hand over the audio it captured
+#: (brief 16). That task feeds captured PCM into the realtime socket, so
+#: cancelling it destroys speech rather than merely delaying a result: it gets
+#: its own, much larger bound instead of the client-write one above.
+STREAM_DRAIN_TIMEOUT = 60.0
+
 PROBE_TIMEOUT = 1.0
 SHUTDOWN_TIMEOUT = 2.0
 
@@ -808,13 +825,38 @@ class DictationServer:
             )
 
     async def _finish_drain(self, job: _StreamJob) -> None:
-        """Wait for the drain task to finish, cancelling it if it will not."""
+        """Wait for the drain task, without ever cancelling away captured audio.
+
+        The drain task is what feeds captured PCM into the realtime socket, so
+        cancelling it discards speech rather than merely delaying a result. It
+        therefore waits on :data:`STREAM_DRAIN_TIMEOUT`, not on the much shorter
+        :data:`DRAIN_TIMEOUT` the client-socket writes use, and a timeout never
+        cancels the task: it is left to finish and the tail is logged as at
+        risk. The recording still completes either way, because the audio that
+        did arrive is worth transcribing.
+        """
         task = job.drain_task
         job.drain_task = None
         if task is None or task is asyncio.current_task():
             return
-        with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(task, timeout=DRAIN_TIMEOUT)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=STREAM_DRAIN_TIMEOUT)
+        except asyncio.CancelledError:
+            # The stop path itself was cancelled: keep the task reachable so
+            # the teardown can still find it.
+            job.drain_task = task
+            raise
+        if task in done:
+            # Retrieve a failure so it is not reported as never retrieved.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.result()
+            return
+        job.drain_task = task
+        logger.warning(
+            "the streaming drain did not finish within %.0fs; the tail of the "
+            "captured audio may be missing from the transcript",
+            STREAM_DRAIN_TIMEOUT,
+        )
 
     async def _stream_failed(self, job: _StreamJob) -> None:
         """End a live recording that failed mid-stream (brief 7).

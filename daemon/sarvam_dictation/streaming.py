@@ -19,6 +19,14 @@ Two properties shape the implementation:
   for as long as the session is open; :meth:`cancel` always joins it, so a
   cancelled session never leaves a task behind.
 
+Brief 16 fixes what "final" means. The first ``transcript.final`` is not the
+answer: the service finalises progressively while the upload drains, so on a
+slow link the first final covers only the audio it has processed so far.
+:meth:`RealtimeTranscriber.finish` therefore waits for the transcript to
+settle - the receiver ending, :data:`FINAL_SETTLE_S` of quiet with at least one
+final in hand, or the :data:`FINAL_DEADLINE_S` cap, which is logged as a
+warning because the tail may then be missing.
+
 Brief 8 adds the model guard: the realtime endpoint serves its own namespace
 (:data:`~sarvam_dictation.config.STREAMING_MODELS`), so :meth:`open` refuses a
 model outside it with ``config_invalid`` before any socket work. Nothing here
@@ -45,6 +53,7 @@ import errno as _errno
 import json
 import logging
 import socket
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -71,13 +80,17 @@ DEFAULT_ENDPOINTING = "manual"
 #: ``connect()`` requires a language code; ``auto`` asks the server to detect it.
 DEFAULT_LANGUAGE_CODE = "auto"
 
-#: How long ``finish()`` waits for a ``transcript.final`` before giving up and
-#: returning whatever was collected. Missing a final is legal, not an error.
-FINAL_TIMEOUT_S = 5.0
+#: The quiet period that settles a transcript: once this long passes with no
+#: new ``transcript.final``, the server has said everything it is going to say
+#: about the audio it has processed, and the result is accepted. Every new
+#: final restarts this window, so a server still working through an upload
+#: backlog keeps the wait open for exactly as long as it needs.
+FINAL_SETTLE_S = 2.5
 
-#: After the first final arrives, give the receiver this long to drain any
-#: further messages the server sent before the socket was closed.
-FINAL_SETTLE_S = 0.2
+#: The hard cap on the whole settle wait. Reaching it means the tail may be
+#: missing, so :meth:`RealtimeTranscriber.finish` logs a warning when it is hit
+#: rather than returning a silently truncated transcript.
+FINAL_DEADLINE_S = 30.0
 
 #: Exception class names (httpx/websockets/requests style) meaning "transport".
 _NETWORK_EXCEPTION_NAMES = frozenset(
@@ -191,6 +204,8 @@ class RealtimeTranscriber:
         self._final_event = asyncio.Event()
         #: utterance_idx -> final text, in arrival order (later re-emits win).
         self._finals: dict[int, str] = {}
+        #: Loop time of the most recent final, or ``None`` until one arrives.
+        self._last_final_at: float | None = None
         self._language: str | None = None
         self._last_partial = ""
         self._error: StreamingError | None = None
@@ -284,8 +299,14 @@ class RealtimeTranscriber:
             logger.debug("dropping audio chunk: %s", self._scrub(str(exc)))
 
     async def finish(self) -> Transcript:
-        """Send speech_end + flush, wait for the final transcript, close the
-        session and return it.
+        """Send speech_end + flush, wait for the transcript to settle, close
+        the session and return it.
+
+        The wait is :meth:`_await_final_settled`, not "the first final": the
+        service finalises progressively as the upload drains, so the transcript
+        is accepted once it has gone quiet, once the socket closes, or when the
+        hard deadline passes - and that last case is logged as a warning
+        because the tail may be missing.
 
         Never raises for a missing final: an empty text with ``segments=0`` is a
         legal result. A fatal ``RealtimeError`` from the server is raised as
@@ -306,9 +327,21 @@ class RealtimeTranscriber:
                         self._error = self._map_exception(exc)
                     break
 
+        settled = True
         try:
-            await self._wait_for_final()
+            settled = await self._await_final_settled()
         finally:
+            if not settled:
+                # Visible rather than silent: the tail of the recording may be
+                # missing because the deadline, not the server, ended the wait.
+                logger.warning(
+                    "no transcript.final arrived within the %.1fs deadline "
+                    "(quiet window %.1fs); returning %d final segment(s) and "
+                    "the tail of the recording may be missing",
+                    FINAL_DEADLINE_S,
+                    FINAL_SETTLE_S,
+                    len(self._finals),
+                )
             await self._close(send_end=True)
 
         if self._error is not None:
@@ -382,6 +415,10 @@ class RealtimeTranscriber:
         if self._language is None and isinstance(language, str) and language:
             self._language = language
         logger.debug("final utterance %d: %d characters", index, len(text))
+        # Recorded next to the event so the settle loop can tell "one final and
+        # then quiet" from "no final at all": the first is settled, the second
+        # is not, and only the deadline may end the second.
+        self._last_final_at = _now()
         self._final_event.set()
 
     def _handle_error(self, message: Any) -> None:
@@ -404,27 +441,67 @@ class RealtimeTranscriber:
         # Wake finish() so it stops waiting for a final that will never come.
         self._final_event.set()
 
-    async def _wait_for_final(self) -> None:
-        """Wait for the first final, the receiver ending, or the timeout."""
+    async def _await_final_settled(self) -> bool:
+        """Wait until the transcript is settled. False means the deadline was hit.
+
+        The first ``transcript.final`` is not the answer. The service finalises
+        progressively while an upload backlog drains, so a slow link delivers a
+        final for the audio processed so far and then keeps delivering more.
+        The transcript is final when any of these is true, checked in this
+        order:
+
+        * the receiver task has ended - the socket closed, so nothing more can
+          arrive;
+        * no new ``transcript.final`` has arrived for :data:`FINAL_SETTLE_S` -
+          the server has gone quiet, so it has said everything it is going to
+          say, and there is at least one final to return;
+        * the hard :data:`FINAL_DEADLINE_S` cap has passed - the tail may be
+          missing, which :meth:`finish` logs as a warning.
+
+        Every new final restarts the quiet timer. "No finals at all" is not the
+        same as "settled empty": an empty result is legal, but only the
+        deadline establishes it, so a session that never answers costs the full
+        deadline rather than being reported empty as soon as it goes quiet.
+        """
         receiver = self._receiver
-        if receiver is None:
-            return
-        if not self._final_event.is_set() and not receiver.done():
+        deadline = _now() + FINAL_DEADLINE_S
+        while True:
+            if receiver is None or receiver.done() or self._fatal:
+                return True
+            remaining = deadline - _now()
+            if remaining <= 0:
+                return False
+            # Clear before waiting: a final that arrived earlier (while the user
+            # was still speaking, or in the previous iteration) is already
+            # accounted for, and the next one is what restarts this window.
+            # Nothing can run between the clear and the await below, so no
+            # final can be lost here.
+            self._final_event.clear()
             waiter = asyncio.ensure_future(self._final_event.wait())
             try:
                 await asyncio.wait(
-                    [waiter, receiver],
-                    timeout=FINAL_TIMEOUT_S,
+                    {waiter, receiver},
+                    timeout=min(FINAL_SETTLE_S, remaining),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
                 waiter.cancel()
-                await asyncio.wait([waiter])
-
-        if self._final_event.is_set() and not receiver.done():
-            # Drain anything the server sent alongside the final, but do not
-            # stall the hotkey release on a session that stays open.
-            await asyncio.wait([receiver], timeout=FINAL_SETTLE_S)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
+            if receiver.done():
+                return True
+            if self._final_event.is_set():
+                # A new final arrived: restart the quiet window.
+                continue
+            if remaining < FINAL_SETTLE_S:
+                # The deadline cut this window short, so the silence seen here
+                # is not a full quiet window: the cap ended the wait, not quiet.
+                return False
+            if self._last_final_at is not None:
+                # Quiet, and there is something to return: this is settled.
+                return True
+            # Nothing at all has been finalised yet. Keep waiting; only the
+            # deadline may declare an empty result.
 
     # -- closing ----------------------------------------------------------
 
@@ -551,6 +628,14 @@ class RealtimeTranscriber:
         if key and len(key) >= 4:
             return text.replace(key, "***")
         return text
+
+
+def _now() -> float:
+    """The running loop's monotonic clock, falling back to ``time.monotonic``."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:  # pragma: no cover - only reachable off the loop
+        return time.monotonic()
 
 
 def _field(message: Any, name: str) -> Any:

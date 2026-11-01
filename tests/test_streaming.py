@@ -16,6 +16,7 @@ import ast
 import asyncio
 import base64
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -38,14 +39,31 @@ class EndOfStream(Exception):
     """What the fake socket raises once its scripted messages run out."""
 
 
+class Pause:
+    """A scripted wait between two messages in a :class:`FakeSocket` script.
+
+    A real service on a slow link finalises, pauses while it chews through the
+    upload backlog, then finalises again. A pause in the script models that
+    without a test having to wait for real seconds.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+
 class FakeSocket:
     """Stand-in for ``AsyncSpeechToTextRealtimeStreamingSocketClient``.
 
     ``messages`` are returned from ``recv()`` in order; an item may be an
-    exception instance, which is raised instead. When the list is exhausted the
+    exception instance, which is raised instead, or a :class:`Pause`, which
+    waits before the next message is returned. When the list is exhausted the
     socket raises :class:`EndOfStream`, exactly as the real one raises when the
     server closes the connection. ``block_forever`` keeps ``recv()`` waiting
     instead, which is what a live session looks like.
+
+    Every message actually handed to the caller is recorded in ``received``
+    together with whether the session had already been closed, so a test can
+    prove the session stayed open past the first final.
     """
 
     def __init__(self, messages=(), block_forever: bool = False) -> None:
@@ -54,14 +72,21 @@ class FakeSocket:
         self._gate = asyncio.Event()
         self.recv_calls = 0
         self.sent: list[tuple[str, dict]] = []
+        self.received: list = []
+        self.closed_when: list[bool] = []
         self.closed = False
 
     async def recv(self):
         self.recv_calls += 1
-        if self._messages:
+        while self._messages:
             message = self._messages.pop(0)
+            if isinstance(message, Pause):
+                await asyncio.sleep(message.seconds)
+                continue
             if isinstance(message, Exception):
                 raise message
+            self.received.append(message)
+            self.closed_when.append(self.closed)
             return message
         if self._block:
             await self._gate.wait()
@@ -532,8 +557,11 @@ def test_no_finals_at_all_gives_an_empty_transcript(make_config):
 def test_finish_times_out_into_an_empty_transcript_when_no_final_ever_arrives(
     make_config, monkeypatch
 ):
-    monkeypatch.setattr(streaming, "FINAL_TIMEOUT_S", 0.05)
+    # Brief 16 replaced the old first-final-plus-FINAL_TIMEOUT_S behaviour: a
+    # session that never finalises anything now ends on the hard deadline, and
+    # that deadline is the only thing that may establish an empty result.
     monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.01)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 0.05)
     socket = FakeSocket([partial("नम")], block_forever=True)
     client = FakeClient(socket)
 
@@ -956,3 +984,211 @@ def test_the_guard_does_not_disturb_the_missing_key_check(make_config):
         assert client.connect_calls == []
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------
+# settling on quiet, not on the first final (brief 16)
+# --------------------------------------------------------------------------
+
+
+def test_the_settle_constants_are_the_frozen_ones():
+    # Brief 16 fixes these two and deletes the old single hard cap.
+    assert streaming.FINAL_SETTLE_S == pytest.approx(2.5)
+    assert streaming.FINAL_DEADLINE_S == pytest.approx(30.0)
+    assert not hasattr(streaming, "FINAL_TIMEOUT_S"), (
+        "the old FINAL_TIMEOUT_S cap is dead code and must be gone"
+    )
+
+
+def test_every_final_is_collected_and_the_session_is_not_closed_after_the_first(
+    make_config, monkeypatch
+):
+    # The regression that matters: a slow server finalises, pauses while it
+    # works through the backlog, then finalises twice more. All three must be
+    # in the transcript, and the session must still be open while they arrive.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.3)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 5.0)
+    socket = FakeSocket(
+        [
+            final("एक", 0),
+            Pause(0.02),
+            final("दो", 1),
+            Pause(0.02),
+            final("तीन", 2),
+        ],
+        block_forever=True,
+    )
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        started = time.monotonic()
+        transcript = await transcriber.finish()
+        return transcript, time.monotonic() - started
+
+    transcript, elapsed = asyncio.run(scenario())
+    assert transcript.text == "एक दो तीन"
+    assert transcript.segments == 3
+    assert len(socket.received) == 3
+    assert socket.closed_when == [False, False, False], (
+        "the session must not be closed after the first final"
+    )
+    assert client.exits == 1
+    assert socket.closed is True
+    # The quiet window, not the first final, ended the wait.
+    assert elapsed >= 0.25
+
+
+def test_a_final_just_before_the_window_expires_restarts_it(make_config, monkeypatch):
+    # The second final lands inside the first quiet window, so the window must
+    # restart: nothing is cut, and the wait lasts longer than one window.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.2)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 5.0)
+    socket = FakeSocket(
+        [final("पहला", 0), Pause(0.12), final("दूसरा", 1)], block_forever=True
+    )
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        started = time.monotonic()
+        transcript = await transcriber.finish()
+        return transcript, time.monotonic() - started
+
+    transcript, elapsed = asyncio.run(scenario())
+    assert transcript.text == "पहला दूसरा"
+    assert transcript.segments == 2
+    assert elapsed >= 0.28, "the quiet window must have been restarted, not cut short"
+    assert socket.closed_when == [False, False]
+
+
+def test_a_single_final_still_waits_out_the_quiet_window(make_config, monkeypatch):
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.15)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 5.0)
+    socket = FakeSocket([final("नमस्ते")], block_forever=True)
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        started = time.monotonic()
+        transcript = await transcriber.finish()
+        return transcript, time.monotonic() - started
+
+    transcript, elapsed = asyncio.run(scenario())
+    assert transcript.text == "नमस्ते"
+    assert transcript.segments == 1
+    assert elapsed >= 0.13
+
+
+def test_no_finals_at_all_takes_the_deadline_path_and_is_logged(
+    make_config, monkeypatch, caplog
+):
+    # "No finals yet" is not "settled empty": the result is empty only because
+    # the deadline passed, and that must be visible in the log.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.02)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 0.05)
+    socket = FakeSocket([partial("नम")], block_forever=True)
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        await pump(socket, 2)
+        return await transcriber.finish()
+
+    with caplog.at_level(logging.WARNING, logger="sarvam_dictation.streaming"):
+        transcript = asyncio.run(scenario())
+
+    assert transcript == Transcript("", None, 0)
+    assert transcript.segments == 0
+    assert client.exits == 1
+    warnings = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.WARNING]
+    assert any("deadline" in message for message in warnings), warnings
+    assert any("0 final segment" in message for message in warnings), warnings
+
+
+def test_a_server_that_never_goes_quiet_hits_the_deadline_and_is_logged(
+    make_config, monkeypatch, caplog
+):
+    # Finals keep arriving faster than the quiet window, so only the hard cap
+    # can end the wait: the tail may be missing, and the warning says how many
+    # finals were collected before the cap stopped it.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 5.0)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 0.15)
+    socket = FakeSocket(
+        [
+            final("एक", 0),
+            Pause(0.04),
+            final("दो", 1),
+            Pause(0.04),
+            final("तीन", 2),
+            Pause(0.04),
+            final("चार", 3),
+            Pause(0.04),
+            final("पाँच", 4),
+        ],
+        block_forever=True,
+    )
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        return await transcriber.finish()
+
+    with caplog.at_level(logging.WARNING, logger="sarvam_dictation.streaming"):
+        transcript = asyncio.run(scenario())
+
+    assert transcript.segments >= 2
+    warnings = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.WARNING]
+    assert any(
+        f"{transcript.segments} final segment" in message for message in warnings
+    ), warnings
+    assert any("may be missing" in message for message in warnings), warnings
+    assert client.exits == 1
+
+
+def test_the_receiver_ending_returns_promptly_instead_of_waiting_out_the_window(
+    make_config, monkeypatch
+):
+    # The server closes the socket, so nothing more can arrive: the wait ends
+    # at once even though the quiet window is far longer.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 5.0)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 30.0)
+    socket = FakeSocket([final("नमस्ते")])
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        started = time.monotonic()
+        transcript = await transcriber.finish()
+        return transcript, time.monotonic() - started
+
+    transcript, elapsed = asyncio.run(scenario())
+    assert transcript.text == "नमस्ते"
+    assert elapsed < 1.0, "a closed socket must not cost the whole quiet window"
+    assert client.exits == 1
+
+
+def test_a_final_arriving_before_finish_is_not_lost(make_config, monkeypatch):
+    # A final that arrived while the user was still speaking is already in
+    # hand when finish() starts: it settles after the quiet window, not before.
+    monkeypatch.setattr(streaming, "FINAL_SETTLE_S", 0.05)
+    monkeypatch.setattr(streaming, "FINAL_DEADLINE_S", 5.0)
+    socket = FakeSocket([final("नमस्ते"), Pause(0.01), final("दुनिया", 1)],
+                        block_forever=True)
+    client = FakeClient(socket)
+
+    async def scenario():
+        transcriber = RealtimeTranscriber(make_config(), client=client)
+        await transcriber.open()
+        await pump(socket, 2)
+        return await transcriber.finish()
+
+    assert asyncio.run(scenario()).text == "नमस्ते दुनिया"
