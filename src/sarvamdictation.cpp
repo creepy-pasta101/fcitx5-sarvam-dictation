@@ -1730,6 +1730,44 @@ void SarvamDictation::commitTranscript(const std::string &transcript) {
         return;
     }
 
+    if (config_.preeditPartials.value()) {
+        // With composition the destination is not a guess: the words were being
+        // composed into the context that had focus when the recording started.
+        // If that context is gone or unfocused -- the user switched windows, the
+        // window closed, or the field never took the composition -- there is
+        // nothing left to put the final into. mostRecentInputContext() is
+        // deliberately not consulted here: after a focus change it is whatever
+        // is focused now, which may be a different application, and typing a
+        // transcript into the wrong window is exactly the failure to avoid. So
+        // the final goes to the clipboard, or is reported as an error, but is
+        // never typed into a guess.
+        InputContext *composed = targetInputContext_.get();
+        if (!composed || !composed->hasFocus()) {
+            if (config_.clipboardFallback.value()) {
+                deliverToClipboard(transcript);
+                return;
+            }
+            showErrorNotification(
+                _("Nothing to type into"),
+                _("The window the transcript was being composed into is gone, "
+                  "and copying to the clipboard is turned off, so the "
+                  "transcript was lost."));
+            return;
+        }
+
+        std::string text = transcript;
+        if (config_.appendSpace.value() && !endsWithWhitespace(text)) {
+            text.push_back(' ');
+        }
+        if (config_.clipboardAlways.value()) {
+            // Copy before committing, for the same reason as the legacy path:
+            // if the commit does something unexpected the copy already exists.
+            deliverToClipboard(transcript);
+        }
+        composed->commitString(text);
+        return;
+    }
+
     InputContext *inputContext = targetInputContext_.get();
     if (!inputContext) {
         // The original client is gone. mostRecentInputContext() is still worth
