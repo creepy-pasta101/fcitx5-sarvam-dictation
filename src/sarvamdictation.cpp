@@ -629,11 +629,31 @@ void SarvamDictation::reloadConfig() {
         // defaults and the user sees the reason when they press Apply.
         FCITX_SARVAMDICTATION_DEBUG()
             << "cannot read " << path << ": " << error;
+    } else if (!config_.apiKey.value().empty()) {
+        // The config page must never show the key. Remember it here and put
+        // the sentinel in the option; setConfig() turns the sentinel back
+        // into the remembered key before saving. Only a successful load is
+        // masked, so a sentinel left in the option by an earlier reload can
+        // never be mistaken for a key.
+        storedApiKey_ = config_.apiKey.value();
+        config_.apiKey.setValue(std::string(kMaskedApiKey));
     }
 }
 
 void SarvamDictation::setConfig(const RawConfig &config) {
     config_.load(config, true);
+
+    // The API key field is write-only. Unchanged sentinel: put the stored
+    // key back. Empty field: the user cleared it, so forget the key. Anything
+    // else is a new key and becomes the one we keep. This runs before
+    // saveDaemonConfig(), so the sentinel can never reach config.toml.
+    if (config_.apiKey.value() == kMaskedApiKey) {
+        config_.apiKey.setValue(storedApiKey_);
+    } else if (config_.apiKey.value().empty()) {
+        storedApiKey_.clear();
+    } else {
+        storedApiKey_ = config_.apiKey.value();
+    }
 
     // Only the addon's own options may reach the fcitx5 conf. Writing the whole
     // Configuration would put the API key into a second file, which is exactly
@@ -662,6 +682,14 @@ void SarvamDictation::setConfig(const RawConfig &config) {
         showErrorNotification(_("Could not save settings"), error);
         return;
     }
+
+    // Mask the key again straight away. The configuration page reads
+    // getConfig() back after Apply, so without this the key the user just typed
+    // would stay visible in the field until the next reload.
+    if (!storedApiKey_.empty()) {
+        config_.apiKey.setValue(std::string(kMaskedApiKey));
+    }
+
     // A daemon that is already running still holds the old values; tell it to
     // re-read the file it just got.
     sendReload();
@@ -1039,11 +1067,30 @@ void SarvamDictation::handleLine(std::string_view line) {
         return;
     }
 
+    if (message.type == "partial") {
+        // A live partial transcript of the recording in progress: it goes
+        // straight to the indicator, so on Plasma the OSD follows the speaker
+        // while the key is held. It can arrive ten times a second, so this
+        // path builds no notification, logs nothing and returns before doing
+        // any work when the text is the one already on screen. An empty text
+        // is ignored rather than used to blank the OSD.
+        if (message.text.empty() || message.text == lastPartial_) {
+            return;
+        }
+        lastPartial_ = message.text;
+        showRecordingIndicator(kAppIcon, lastPartial_,
+                               _("Release the key to finish."));
+        return;
+    }
+
     if (message.type == "state") {
         // The daemon broadcasts its state to every client, so this is the only
         // authoritative answer to "am I recording?". The push-to-talk release
         // reads it; see endPushToTalk().
         lastState_ = message.state;
+        // Whatever partial was on screen described the recording that just
+        // ended, so the next one starts from a clean slate.
+        lastPartial_.clear();
         if (message.state == "recording") {
             showRecordingIndicator(kAppIcon, _("Listening"),
                                    _("Press the hotkey again to stop."));
@@ -1059,6 +1106,8 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "result") {
+        // The final transcript supersedes any partial of this recording.
+        lastPartial_.clear();
         // Only act on a transcript we asked for. An empty id cannot be matched
         // and is accepted, because a daemon that lost its id is still telling
         // us about the recording we started.

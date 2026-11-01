@@ -4,6 +4,10 @@ Covers defaults with no file, a fully populated TOML file, every documented
 validation error, malformed TOML, the "env fills in but never overrides" rule
 for the API key, forward-compatible unknown keys, and the §4 socket-path
 resolution rule.
+
+The last section covers brief 7's ``[api] streaming``: off by default, forced on
+by ``saaras:v3-realtime``, and rejected with a model the realtime endpoint does
+not serve.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from sarvam_dictation.config import (
     DEFAULT_MODEL,
     DEFAULT_MODE,
     DEFAULT_SAMPLE_RATE,
+    REALTIME_MODEL,
+    STREAMING_MODELS,
     VALID_BACKENDS,
     VALID_MODES,
     Config,
@@ -297,3 +303,101 @@ def test_load_config_reads_the_default_path_when_none_is_given(tmp_path, monkeyp
 def test_load_config_tolerates_a_missing_default_config_file(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nowhere"))
     assert load_config(env={}) == Config()
+
+
+# --------------------------------------------------------------------------
+# streaming (brief 7)
+# --------------------------------------------------------------------------
+
+
+def test_streaming_defaults_to_off(tmp_path):
+    config = load_config(path=tmp_path / "does-not-exist.toml", env={})
+    assert Config().streaming is False
+    assert config.streaming is False
+
+
+def test_streaming_constants_name_the_realtime_model():
+    assert REALTIME_MODEL == "saaras:v3-realtime"
+    assert STREAMING_MODELS == ("saaras:v3-realtime", "saaras:v4")
+
+
+def test_streaming_true_with_saaras_v4_is_accepted(tmp_path):
+    path = write_config(tmp_path, '[api]\nmodel = "saaras:v4"\nstreaming = true\n')
+    config = load_config(path=path, env={})
+    assert config.streaming is True
+    assert config.model == "saaras:v4"
+
+
+def test_streaming_true_with_saaras_v3_is_rejected_naming_the_option_and_the_model(tmp_path):
+    path = write_config(tmp_path, '[api]\nmodel = "saaras:v3"\nstreaming = true\n')
+    with pytest.raises(ConfigError) as raised:
+        load_config(path=path, env={})
+    message = str(raised.value)
+    assert "[api] streaming" in message
+    assert "saaras:v3" in message
+
+
+@pytest.mark.parametrize("model", ["saaras:v3", "whisper-large", ""])
+def test_streaming_true_with_an_unsupported_model_is_rejected(tmp_path, model):
+    text = f'[api]\nmodel = "{model}"\nstreaming = true\n'
+    with pytest.raises(ConfigError):
+        load_config(path=write_config(tmp_path, text), env={})
+
+
+def test_streaming_false_with_saaras_v3_is_still_accepted(tmp_path):
+    path = write_config(tmp_path, '[api]\nmodel = "saaras:v3"\nstreaming = false\n')
+    config = load_config(path=path, env={})
+    assert config.streaming is False
+    assert config.model == "saaras:v3"
+
+
+def test_the_realtime_model_forces_streaming_on_when_the_option_is_absent(tmp_path):
+    path = write_config(tmp_path, '[api]\nmodel = "saaras:v3-realtime"\n')
+    config = load_config(path=path, env={})
+    assert config.model == "saaras:v3-realtime"
+    assert config.streaming is True
+
+
+def test_the_realtime_model_forces_streaming_on_over_an_explicit_false(tmp_path):
+    path = write_config(
+        tmp_path, '[api]\nmodel = "saaras:v3-realtime"\nstreaming = false\n'
+    )
+    assert load_config(path=path, env={}).streaming is True
+
+
+def test_the_realtime_model_with_streaming_true_is_accepted(tmp_path):
+    path = write_config(
+        tmp_path, '[api]\nmodel = "saaras:v3-realtime"\nstreaming = true\n'
+    )
+    config = load_config(path=path, env={})
+    assert config.streaming is True
+    assert config.model == "saaras:v3-realtime"
+
+
+@pytest.mark.parametrize("value", ['"true"', "1", "0", "[]", '"yes"'])
+def test_non_boolean_streaming_is_rejected(tmp_path, value):
+    path = write_config(tmp_path, f"[api]\nstreaming = {value}\n")
+    with pytest.raises(ConfigError) as raised:
+        load_config(path=path, env={})
+    assert "[api] streaming" in str(raised.value)
+
+
+def test_streaming_leaves_every_other_field_alone(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[api]\nkey = "k"\nmodel = "saaras:v4"\nstreaming = true\nmode = "verbatim"\n'
+        '\n[audio]\nsample_rate = 8000\n\n[server]\nmax_duration_s = 9\n',
+    )
+    config = load_config(path=path, env={})
+    assert config.streaming is True
+    assert (config.mode, config.sample_rate, config.max_duration_s) == ("verbatim", 8000, 9)
+    assert config.api_key == "k"
+
+
+def test_streaming_takes_no_part_in_repr_or_equality_ordering_of_existing_fields():
+    # Adding the field must not have moved any pre-existing field: the
+    # keyword-only construction every caller uses still works, and the two
+    # configurations differ exactly by ``streaming``.
+    assert Config(streaming=True) != Config()
+    assert dataclasses.replace(Config(), streaming=True) == Config(streaming=True)
+    assert Config(streaming=True).model == DEFAULT_MODEL

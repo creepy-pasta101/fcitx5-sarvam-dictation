@@ -3,6 +3,9 @@
 The protocol is the frozen contract between the C++ addon and this daemon, so
 these tests are deliberately pedantic: exact key sets, compact encoding, UTF-8
 survival, and every documented rejection path of ``decode_line``/``LineReader``.
+
+The last section covers brief 7's one addition: ``partial_msg``. It is a server
+message only - no command was added - and it must not disturb ``result``.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import json
 import pytest
 
 from sarvam_dictation.protocol import (
+    COMMANDS as COMMANDS_UNCHANGED,
     COMMANDS as PROTOCOL_COMMANDS,
     MAX_LINE,
     STATE_IDLE,
@@ -23,6 +27,7 @@ from sarvam_dictation.protocol import (
     decode_line,
     encode,
     error_msg,
+    partial_msg,
     result_msg,
     state_msg,
 )
@@ -361,3 +366,59 @@ def test_reload_messages_round_trip_through_the_line_reader():
         reloaded_msg("a1"),
         config_invalid_msg("[api] model", "b2"),
     ]
+
+
+# --------------------------------------------------------------------------
+# partial (brief 7)
+# --------------------------------------------------------------------------
+
+
+def test_partial_msg_has_exactly_the_documented_keys_and_values():
+    assert partial_msg("start-uuid", "नमस्ते दुनिया") == {
+        "v": 1,
+        "type": "partial",
+        "id": "start-uuid",
+        "text": "नमस्ते दुनिया",
+    }
+
+
+def test_partial_msg_key_order_is_version_type_id_text():
+    assert list(partial_msg("a", "b")) == ["v", "type", "id", "text"]
+
+
+def test_partial_msg_encodes_as_one_compact_utf8_line():
+    data = encode(partial_msg("id-1", "नमस्ते"))
+    assert data.endswith(b"\n") and data.count(b"\n") == 1
+    assert "नमस्ते".encode("utf-8") in data
+    assert b'": ' not in data and b", " not in data
+
+
+def test_partial_msg_round_trips_through_decode_line():
+    message = partial_msg("id-1", "मैं ठीक हूँ 🎤")
+    assert decode_line(encode(message)) == message
+
+
+def test_partial_is_not_a_command():
+    assert "partial" not in PROTOCOL_COMMANDS
+    assert "partial" not in SERVER_COMMANDS
+    assert COMMANDS_UNCHANGED == ("start", "stop", "toggle", "cancel", "ping")
+
+
+def test_partial_msg_does_not_validate_the_text_it_is_given():
+    # The daemon strips before building the message; the builder itself is a
+    # plain constructor so an empty payload cannot raise mid-recording.
+    assert partial_msg("id", "")["text"] == ""
+
+
+def test_result_msg_is_unchanged_by_the_partial_addition():
+    message = result_msg("stop-id", "नमस्ते", "hi-IN", 1234, 2)
+    assert list(message) == [
+        "v",
+        "type",
+        "id",
+        "text",
+        "language_code",
+        "duration_ms",
+        "segments",
+    ]
+    assert message["type"] == "result"

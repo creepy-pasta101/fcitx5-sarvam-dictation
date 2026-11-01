@@ -137,6 +137,7 @@ def _run_check(config: Config, config_path: Path | None, socket_override: str | 
         problems.append("no API key")
 
     print(f"model:        {config.model}")
+    print(f"streaming:    {'on (realtime websocket)' if config.streaming else 'off (one request per recording)'}")
     print(f"mode:         {config.mode}")
     print(f"language:     {config.language_code or 'auto-detect'}")
     print(f"keyterms:     {len(config.keyterms)}")

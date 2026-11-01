@@ -10,9 +10,16 @@ Ordering is never assumed where the brief does not fix it: helpers read until a
 predicate matches, and "nothing else arrived" is proved with a ping barrier
 rather than a sleep.
 
-The last section covers brief 2, section 6: the ``reload`` command, its
+The last two sections cover brief 2, section 6 (the ``reload`` command, its
 ``reloaded``/``config_invalid`` replies, and the guarantee that a reload never
-touches work that is already recording or transcribing.
+touches work that is already recording or transcribing) and brief 7 (the live
+streaming path: partials to the owner only, throttled, then a ``result``).
+
+The streaming fakes mirror the frozen ``StreamingRecorder`` /
+``RealtimeTranscriber`` contracts (asynchronous ``start``/``chunks``/``stop``/
+``cancel`` and ``open``/``feed``/``finish``/``cancel``) and are injected through
+``stream_recorder_factory`` and ``stream_transcriber_factory``. No audio
+hardware, no socket to Sarvam, and no ``sarvamai`` SDK is touched.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ import pytest
 
 import sarvam_dictation.server as server_module
 from sarvam_dictation.config import Config, load_config
-from sarvam_dictation.server import DictationServer
+from sarvam_dictation.server import PARTIAL_INTERVAL, DictationServer
 
 READ_TIMEOUT = 2.0
 QUIET_WINDOW = 0.15
@@ -993,3 +1000,750 @@ def test_reload_without_an_id_is_bad_request_and_changes_nothing(tmp_path, confi
             await client.close()
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------
+# streaming (brief 7)
+# --------------------------------------------------------------------------
+
+
+class FakeStreamingError(Exception):
+    """A ``StreamingError`` stand-in.
+
+    The daemon reads only ``.code`` from it, exactly as the frozen
+    ``streaming.StreamingError`` contract specifies, so the real class - which
+    lives in a module this unit does not own - is not needed here.
+    """
+
+    def __init__(self, message="streaming failed", code="api"):
+        super().__init__(message)
+        self.code = code
+
+
+class FakeTranscript:
+    """The ``streaming.Transcript`` shape the ``result`` path reads."""
+
+    def __init__(self, text, language_code, segments):
+        self.text = text
+        self.language_code = language_code
+        self.segments = segments
+
+
+class FakeStreamingRecorder:
+    """A ``StreamingRecorder`` stand-in: yields canned PCM, then blocks.
+
+    ``chunks()`` ends when the child "exits", which the fake models with an
+    event that ``stop()`` and ``cancel()`` set.
+    """
+
+    def __init__(self, duration_ms=1234, chunks=(b"\x00\x01" * 160, b"\x02\x03" * 160)):
+        self.duration_ms = duration_ms
+        self.chunks_offered = list(chunks)
+        self.started = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.cancel_calls = 0
+        self.ended = asyncio.Event()
+
+    async def start(self):
+        self.start_calls += 1
+        self.started = True
+
+    async def chunks(self):
+        for chunk in self.chunks_offered:
+            yield chunk
+        await self.ended.wait()
+
+    async def stop(self):
+        self.stop_calls += 1
+        self.started = False
+        self.ended.set()
+        return self.duration_ms
+
+    async def cancel(self):
+        self.cancel_calls += 1
+        self.started = False
+        self.ended.set()
+
+
+class FakeStreamingTranscriber:
+    """A ``RealtimeTranscriber`` stand-in driven entirely from the test.
+
+    ``partials`` are handed out one per ``feed`` call, so a partial can be tied
+    to audio arriving; ``emit`` pushes one by hand. ``open_error``,
+    ``feed_error`` and ``finish_error`` make the matching stage fail.
+    """
+
+    def __init__(
+        self,
+        on_partial=None,
+        text="नमस्ते दुनिया",
+        language_code="hi-IN",
+        segments=2,
+        partials=(),
+        open_error=None,
+        feed_error=None,
+        finish_error=None,
+    ):
+        self.on_partial = on_partial
+        self.text = text
+        self.language_code = language_code
+        self.segments = segments
+        self.pending_partials = list(partials)
+        self.open_error = open_error
+        self.feed_error = feed_error
+        self.finish_error = finish_error
+        self.fed = []
+        self.open_calls = 0
+        self.finish_calls = 0
+        self.cancel_calls = 0
+
+    async def open(self):
+        self.open_calls += 1
+        if self.open_error is not None:
+            raise self.open_error
+
+    async def feed(self, pcm):
+        if self.feed_error is not None:
+            raise self.feed_error
+        self.fed.append(pcm)
+        if self.pending_partials:
+            self.emit(self.pending_partials.pop(0))
+
+    def emit(self, text):
+        """Deliver one partial, exactly as the receiver task would."""
+        if self.on_partial is not None:
+            self.on_partial(text)
+
+    async def finish(self):
+        self.finish_calls += 1
+        if self.finish_error is not None:
+            raise self.finish_error
+        return FakeTranscript(self.text, self.language_code, self.segments)
+
+    async def cancel(self):
+        self.cancel_calls += 1
+
+
+class StreamRecorderFactory:
+    """Callable ``stream_recorder_factory`` that exposes its instance."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.recorder
+
+
+class StreamTranscriberFactory:
+    """Callable ``stream_transcriber_factory``, called with ``on_partial``."""
+
+    def __init__(self, transcriber):
+        self.transcriber = transcriber
+        self.calls = 0
+        self.on_partials = []
+
+    def __call__(self, on_partial):
+        self.calls += 1
+        self.on_partials.append(on_partial)
+        self.transcriber.on_partial = on_partial
+        return self.transcriber
+
+
+class StreamKit:
+    """The fakes plus their factories, so a test can assert on both."""
+
+    def __init__(self, recorder=None, transcriber=None):
+        self.recorder = recorder if recorder is not None else FakeStreamingRecorder()
+        self.transcriber = (
+            transcriber if transcriber is not None else FakeStreamingTranscriber()
+        )
+        self.recorder_factory = StreamRecorderFactory(self.recorder)
+        self.transcriber_factory = StreamTranscriberFactory(self.transcriber)
+
+
+def make_streaming_server(config, socket_path, kit=None, **kwargs):
+    """A server whose live path is wired to the fakes in ``kit``."""
+    kit = kit or StreamKit()
+    server = DictationServer(
+        config,
+        stream_recorder_factory=kit.recorder_factory,
+        stream_transcriber_factory=kit.transcriber_factory,
+        socket_path=str(socket_path),
+        **kwargs,
+    )
+    return server, kit
+
+
+def partial_texts(client):
+    return [m["text"] for m in client.received if m.get("type") == "partial"]
+
+
+def is_partial(text=None):
+    if text is None:
+        return is_type("partial")
+    return lambda message: message.get("type") == "partial" and message.get("text") == text
+
+
+def test_the_partial_interval_is_a_tenth_of_a_second():
+    assert PARTIAL_INTERVAL == pytest.approx(0.1)
+
+
+@pytest.fixture
+def streaming_config(make_config):
+    """A ``Config`` with the live path on, using a model that supports it."""
+    return make_config(streaming=True, model="saaras:v4")
+
+
+def test_streaming_start_sends_a_partial_and_stop_sends_the_result(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(
+        recorder=FakeStreamingRecorder(duration_ms=2345),
+        transcriber=FakeStreamingTranscriber(
+            text="नमस्ते दुनिया", language_code="hi-IN", segments=2, partials=["नमस्ते"]
+        ),
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+
+            await client.send({"v": 1, "cmd": "start", "id": "start-id"})
+            assert (await client.read_until(is_state("recording")))["id"] == "start-id"
+
+            first = await client.read_until(is_partial())
+            assert first == {
+                "v": 1,
+                "type": "partial",
+                "id": "start-id",
+                "text": "नमस्ते",
+            }
+
+            kit.transcriber.emit("नमस्ते दुनिया")
+            second = await client.read_until(is_partial("नमस्ते दुनिया"))
+            assert second["id"] == "start-id"
+
+            await client.send({"v": 1, "cmd": "stop", "id": "stop-id"})
+            assert (await client.read_until(is_state("transcribing")))["id"] == "stop-id"
+
+            result, idle = await client.read_until_all([is_type("result"), is_state("idle")])
+            assert result["id"] == "stop-id"
+            assert result["text"] == "नमस्ते दुनिया"
+            assert result["language_code"] == "hi-IN"
+            assert result["segments"] == 2
+            assert result["duration_ms"] == 2345
+            assert isinstance(result["duration_ms"], int)
+            assert idle["id"] == "stop-id"
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.start_calls == 1
+    assert kit.recorder.stop_calls == 1
+    assert kit.transcriber.open_calls == 1
+    assert kit.transcriber.finish_calls == 1
+    assert kit.transcriber.fed, "the drain task must have fed the captured PCM"
+    assert kit.transcriber_factory.calls == 1
+
+
+def test_streaming_partials_carry_the_start_id_and_never_replace_the_result(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(
+        transcriber=FakeStreamingTranscriber(text="final text", partials=["a", "b", "c"])
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "S"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "T"})
+            result = await client.read_until(is_type("result"))
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+            assert result["id"] == "T"
+            assert result["text"] == "final text"
+            partials = [m for m in client.received if m.get("type") == "partial"]
+            assert partials, "at least one partial must have been delivered"
+            assert all(m["id"] == "S" for m in partials)
+            assert all(m["type"] == "partial" for m in partials)
+
+    asyncio.run(scenario())
+
+
+def test_streaming_partials_reach_the_owner_only(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            owner = await Client.connect(sock)
+            watcher = await Client.connect(sock)
+
+            await owner.send({"v": 1, "cmd": "start", "id": "s1"})
+            await owner.read_until(is_state("recording"))
+            await watcher.read_until(is_state("recording"))
+
+            await owner.read_until(is_partial("नमस्ते"))
+            kit.transcriber.emit("नमस्ते दुनिया")
+            await owner.read_until(is_partial("नमस्ते दुनिया"))
+
+            # A ping barrier proves nothing else is still in flight.
+            await watcher.barrier()
+            assert not any(m.get("type") == "partial" for m in watcher.received)
+            assert not any(m.get("type") == "result" for m in watcher.received)
+
+            await owner.send({"v": 1, "cmd": "stop", "id": "s2"})
+            await owner.read_until(is_type("result"))
+            await watcher.read_until(is_state("idle"))
+            assert not any(m.get("type") == "partial" for m in watcher.received)
+            assert not any(m.get("type") == "result" for m in watcher.received)
+
+            await owner.close()
+            await watcher.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_partials_are_throttled_to_about_ten_a_second(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["one"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            loop = asyncio.get_running_loop()
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("one"))
+
+            started = loop.time()
+            kit.transcriber.emit("two")
+            second = await client.read_until(is_partial("two"))
+            assert second["text"] == "two"
+            # At most one message per 100 ms, so the second partial had to wait
+            # for the window opened by the first. The floor is written out
+            # rather than derived from the constant, so a broken throttle cannot
+            # make this assertion vacuous.
+            assert loop.time() - started >= 0.09
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_coalesces_a_burst_and_still_delivers_the_last_partial(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber())
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            await client.read_until(is_state("recording"))
+
+            for index in range(30):
+                kit.transcriber.emit(f"p{index}")
+
+            await client.read_until(is_partial("p29"))
+            texts = partial_texts(client)
+            assert texts[-1] == "p29"
+            assert len(texts) < 30, "a burst must be coalesced, not queued"
+
+            # A repeat of the text already shown is not resent.
+            kit.transcriber.emit("p29")
+            await asyncio.sleep(PARTIAL_INTERVAL * 2)
+            await client.barrier()
+            assert partial_texts(client).count("p29") == 1
+
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_flushes_the_newest_partial_before_the_result(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["first"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("first"))
+
+            # Emitted inside the throttle window: only the stop path can
+            # deliver it, and it must be delivered before the result.
+            kit.transcriber.emit("second")
+            await client.send({"v": 1, "cmd": "stop", "id": "s2"})
+
+            await client.read_until(is_partial("second"))
+            result = await client.read_until(is_type("result"))
+            assert result["id"] == "s2"
+            assert result["text"] == "नमस्ते दुनिया"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_cancel_mid_stream_produces_no_result(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "c1"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("नमस्ते"))
+
+            await client.send({"v": 1, "cmd": "cancel", "id": "c2"})
+            assert (await client.read_until(is_state("idle")))["id"] == "c2"
+            # By the time idle is on the wire both sides of the live job have
+            # been cancelled - checked here, before any later recording could
+            # bump the counters.
+            assert kit.recorder.cancel_calls == 1
+            assert kit.transcriber.cancel_calls == 1
+            assert kit.transcriber.finish_calls == 0
+            await client.barrier()
+            assert not any(m.get("type") == "result" for m in client.received)
+
+            # A fresh streaming recording must still be possible.
+            await client.send({"v": 1, "cmd": "start", "id": "c3"})
+            assert (await client.read_until(is_state("recording")))["id"] == "c3"
+            await client.send({"v": 1, "cmd": "cancel", "id": "c4"})
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.cancel_calls >= 1
+    assert kit.transcriber.cancel_calls >= 1
+    assert kit.transcriber.finish_calls == 0
+
+
+def test_streaming_error_at_open_becomes_an_error_message_with_its_code(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(
+        transcriber=FakeStreamingTranscriber(
+            open_error=FakeStreamingError("no key configured", code="no_api_key")
+        )
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            error = await client.read_until(is_error("no_api_key"))
+            assert error["id"] == "s1"
+            assert error["v"] == 1
+            assert "no key configured" in error["message"]
+
+            # Nothing is recording, so the daemon is idle and a new start from
+            # another client is accepted rather than reported busy.
+            assert server.state == "idle"
+            await client.barrier()
+            assert not any(m.get("type") == "state" for m in client.received)
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.cancel_calls == 1
+    assert kit.transcriber.cancel_calls == 1
+
+
+def test_streaming_error_mid_feed_ends_the_recording(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(
+        transcriber=FakeStreamingTranscriber(
+            feed_error=FakeStreamingError("socket closed", code="network")
+        )
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            owner = await Client.connect(sock)
+            watcher = await Client.connect(sock)
+
+            await owner.send({"v": 1, "cmd": "start", "id": "s1"})
+            await owner.read_until(is_state("recording"))
+            await watcher.read_until(is_state("recording"))
+
+            error = await owner.read_until(is_error("network"))
+            assert error["id"] == "s1"
+            assert "socket closed" in error["message"]
+            await watcher.read_until(is_state("idle"))
+            await owner.read_until(is_state("idle"))
+            assert server.state == "idle"
+
+            # The daemon is idle again, so the watcher can start its own.
+            await watcher.send({"v": 1, "cmd": "start", "id": "w1"})
+            assert (await watcher.read_until(is_state("recording")))["id"] == "w1"
+
+            await owner.close()
+            await watcher.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.cancel_calls >= 1
+    assert kit.transcriber.cancel_calls >= 1
+
+
+def test_streaming_error_at_finish_is_reported_with_the_stop_id(
+    tmp_path, streaming_config
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(
+        transcriber=FakeStreamingTranscriber(
+            finish_error=FakeStreamingError("upstream said no", code="api")
+        )
+    )
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "s1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "s2"})
+
+            error = await client.read_until(is_error("api"))
+            assert error["id"] == "s2"
+            await client.read_until(is_state("idle"))
+            assert server.state == "idle"
+            assert not any(m.get("type") == "result" for m in client.received)
+            # No API key may ever leave the daemon in a message.
+            assert not any(
+                streaming_config.api_key in (m.get("message") or "") for m in client.received
+            )
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_keeps_the_busy_and_ownership_rules(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            owner = await Client.connect(sock)
+            other = await Client.connect(sock)
+
+            await owner.send({"v": 1, "cmd": "start", "id": "o1"})
+            await owner.read_until(is_state("recording"))
+            await other.read_until(is_state("recording"))
+
+            await other.send({"v": 1, "cmd": "start", "id": "o2"})
+            busy = await other.read_until(is_error("busy"))
+            assert busy["id"] == "o2"
+
+            await other.send({"v": 1, "cmd": "stop", "id": "o3"})
+            busy = await other.read_until(is_error("busy"))
+            assert busy["id"] == "o3"
+            assert "another client owns the recording" in busy["message"]
+
+            await other.send({"v": 1, "cmd": "cancel", "id": "o4"})
+            busy = await other.read_until(is_error("busy"))
+            assert busy["id"] == "o4"
+
+            # The owner is still recording and can still finish.
+            await owner.send({"v": 1, "cmd": "stop", "id": "o5"})
+            assert (await owner.read_until(is_type("result")))["id"] == "o5"
+            await owner.read_until(is_state("idle"))
+
+            await owner.close()
+            await other.close()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_owner_disconnect_mid_recording_cancels_both(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            owner = await Client.connect(sock)
+            watcher = await Client.connect(sock)
+
+            await owner.send({"v": 1, "cmd": "start", "id": "d1"})
+            await owner.read_until(is_state("recording"))
+            await watcher.read_until(is_state("recording"))
+
+            await owner.close()
+            await watcher.read_until(is_state("idle"))
+            assert not any(m.get("type") == "result" for m in watcher.received)
+            assert kit.recorder.cancel_calls == 1
+            assert kit.transcriber.cancel_calls == 1
+            assert kit.transcriber.finish_calls == 0
+
+            await watcher.send({"v": 1, "cmd": "start", "id": "d2"})
+            assert (await watcher.read_until(is_state("recording")))["id"] == "d2"
+            await watcher.send({"v": 1, "cmd": "cancel", "id": "d3"})
+            await watcher.read_until(is_state("idle"))
+            await watcher.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.cancel_calls >= 1
+    assert kit.transcriber.cancel_calls >= 1
+    assert kit.transcriber.finish_calls == 0
+
+
+def test_streaming_toggle_starts_and_stops_the_live_path(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "toggle", "id": "t1"})
+            assert (await client.read_until(is_state("recording")))["id"] == "t1"
+            await client.read_until(is_partial("नमस्ते"))
+
+            await client.send({"v": 1, "cmd": "toggle", "id": "t2"})
+            result = await client.read_until(is_type("result"))
+            assert result["id"] == "t2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.transcriber.finish_calls == 1
+
+
+def test_streaming_auto_stop_uses_the_same_timer(tmp_path, make_config):
+    sock = tmp_path / "dictation.sock"
+    config = make_config(streaming=True, model="saaras:v4", max_duration_s=1)
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(config, sock, kit)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "a1"})
+            await client.read_until(is_state("recording"))
+            result = await client.read_until(is_type("result"), timeout=GATE_TIMEOUT)
+            assert result["id"] == "a1"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.recorder.stop_calls == 1
+
+
+def test_the_file_path_is_untouched_when_streaming_is_off(
+    tmp_path, config, recorder_factory, transcriber_factory
+):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit()
+    server = DictationServer(
+        config,
+        recorder_factory=recorder_factory,
+        transcriber_factory=transcriber_factory,
+        stream_recorder_factory=kit.recorder_factory,
+        stream_transcriber_factory=kit.transcriber_factory,
+        socket_path=str(sock),
+    )
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "f1"})
+            await client.read_until(is_state("recording"))
+            await client.send({"v": 1, "cmd": "stop", "id": "f2"})
+            result = await client.read_until(is_type("result"))
+            assert result["id"] == "f2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    # The streaming factories were never consulted.
+    assert kit.recorder_factory.calls == 0
+    assert kit.transcriber_factory.calls == 0
+    assert kit.recorder.start_calls == 0
+    assert kit.transcriber.open_calls == 0
+    # Meanwhile the file-based fakes did all the work, as before.
+    assert recorder_factory.calls == 1
+    assert recorder_factory.recorder.stop_calls == 1
+    assert len(transcriber_factory.transcriber.calls) == 1
+
+
+def test_the_realtime_model_from_a_config_file_selects_the_live_path(tmp_path):
+    """End to end: ``model = saaras:v3-realtime`` forces streaming on."""
+    sock = tmp_path / "dictation.sock"
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[api]\nkey = "fake-key-not-real"\nmodel = "saaras:v3-realtime"\n',
+        encoding="utf-8",
+    )
+    config = load_config(config_file, env={})
+    assert config.streaming is True
+
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(config, sock, kit, config_path=config_file)
+
+    async def scenario():
+        async with running(server):
+            client = await Client.connect(sock)
+            await client.send({"v": 1, "cmd": "start", "id": "r1"})
+            await client.read_until(is_state("recording"))
+            await client.read_until(is_partial("नमस्ते"))
+            await client.send({"v": 1, "cmd": "stop", "id": "r2"})
+            assert (await client.read_until(is_type("result")))["id"] == "r2"
+            await client.read_until(is_state("idle"))
+            await client.close()
+
+    asyncio.run(scenario())
+    assert kit.transcriber_factory.calls == 1
+    assert kit.recorder_factory.calls == 1
+
+
+def test_streaming_leaves_no_task_behind_after_shutdown(tmp_path, streaming_config):
+    sock = tmp_path / "dictation.sock"
+    kit = StreamKit(transcriber=FakeStreamingTranscriber(partials=["नमस्ते"]))
+    server, kit = make_streaming_server(streaming_config, sock, kit)
+
+    async def scenario():
+        await server.start()
+        task = asyncio.create_task(server.serve_forever())
+        client = await Client.connect(sock)
+        await client.send({"v": 1, "cmd": "start", "id": "z1"})
+        await client.read_until(is_state("recording"))
+        await client.read_until(is_partial("नमस्ते"))
+
+        await server.shutdown()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        await client.close()
+
+        # Only this test's own task should remain.
+        pending = [t for t in asyncio.all_tasks() if not t.done()]
+        assert pending == [asyncio.current_task()]
+
+    asyncio.run(scenario())
+    assert kit.recorder.cancel_calls >= 1
+    assert kit.transcriber.cancel_calls >= 1

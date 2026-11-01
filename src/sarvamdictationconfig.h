@@ -92,10 +92,12 @@ namespace fcitx::sarvam {
  * Dictation model. The stored name is the value the Sarvam API expects, so the
  * TOML file and the daemon both use "saaras:v4" while the UI shows a sentence.
  */
-enum class DictationModel { SaarasV4, SaarasV3 };
-FCITX_CONFIG_ENUM_NAME(DictationModel, "saaras:v4", "saaras:v3");
+enum class DictationModel { SaarasV4, SaarasV3, SaarasV3Realtime };
+FCITX_CONFIG_ENUM_NAME(DictationModel, "saaras:v4", "saaras:v3",
+                       "saaras:v3-realtime");
 SARVAM_DICTATION_ENUM_LABELS(DictationModel, N_("Saaras v4 (recommended)"),
-                             N_("Saaras v3"));
+                             N_("Saaras v3"),
+                             N_("Saaras v3 realtime (streaming)"));
 
 /// What the daemon does with the recording.
 enum class DictationMode { Transcribe, Translate, Verbatim, Translit, Codemix };
@@ -175,6 +177,12 @@ FCITX_CONFIGURATION(
     Option<std::string> apiKey{this, "ApiKey", _("Sarvam API key"), ""};
     OptionWithAnnotation<DictationModel, DictationModelI18NAnnotation> model{
         this, "Model", _("Model"), DictationModel::SaarasV4};
+    // Off by default: the REST path stays the default. Only the realtime
+    // models have a streaming endpoint, and the daemon forces this on for
+    // saaras:v3-realtime regardless of the stored value.
+    Option<bool> streaming{
+        this, "Streaming",
+        _("Stream audio while recording (realtime models)"), false};
     OptionWithAnnotation<DictationMode, DictationModeI18NAnnotation> mode{
         this, "Mode", _("Output mode"), DictationMode::Transcribe};
     OptionWithAnnotation<DictationLanguage, DictationLanguageI18NAnnotation>

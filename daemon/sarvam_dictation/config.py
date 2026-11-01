@@ -7,6 +7,12 @@ Brief 2 adds one thing here and nothing else: a :class:`Config` remembers the
 path it was loaded from, so a running daemon can re-read *the same file* when
 the addon asks it to reload (brief section 6) without the caller having to
 remember the path a second time.
+
+Brief 7 adds ``[api] streaming``: transcribe through Sarvam's realtime
+WebSocket API while the user is still speaking. ``saaras:v3-realtime`` has no
+REST equivalent, so naming it forces streaming on; asking for streaming with a
+model that has no realtime support is rejected outright rather than silently
+falling back to REST.
 """
 
 from __future__ import annotations
@@ -26,6 +32,14 @@ DEFAULT_MODE = "transcribe"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_BACKEND = "auto"
 DEFAULT_MAX_DURATION_S = 300
+
+#: The realtime model (brief 7). It exists only on the WebSocket endpoint, so
+#: choosing it implies ``streaming = true``.
+REALTIME_MODEL = "saaras:v3-realtime"
+
+#: The models the realtime endpoint serves, and therefore the only models that
+#: may be combined with ``[api] streaming = true``.
+STREAMING_MODELS = (REALTIME_MODEL, "saaras:v4")
 
 VALID_MODES = ("transcribe", "translate", "verbatim", "translit", "codemix")
 VALID_BACKENDS = ("auto", "pipewire", "pulse", "alsa")
@@ -56,6 +70,10 @@ class Config:
     backend: str = DEFAULT_BACKEND
     socket_path: str = ""
     max_duration_s: int = DEFAULT_MAX_DURATION_S
+    #: Transcribe while recording through the realtime WebSocket API instead of
+    #: sending one WAV to the REST endpoint at the end. Off by default: the REST
+    #: path is the default and needs no realtime subscription.
+    streaming: bool = False
     #: The file this configuration was read from; ``""`` when it was built by
     #: hand. It takes no part in equality, hashing or ``repr``, so every
     #: ``Config(...)`` comparison written before brief 2 keeps working.
@@ -106,6 +124,19 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
     if mode not in VALID_MODES:
         raise ConfigError(f"[api] mode {mode!r} is not one of {', '.join(VALID_MODES)}")
 
+    # Streaming is opt-in, with two rules (brief 7): the realtime model has no
+    # REST equivalent so it forces streaming on, and streaming with a model the
+    # realtime endpoint does not serve is a configuration error rather than a
+    # silent downgrade to REST.
+    streaming = _boolean(api, "streaming", False, "[api] streaming")
+    if model == REALTIME_MODEL:
+        streaming = True
+    elif streaming and model not in STREAMING_MODELS:
+        raise ConfigError(
+            f"[api] streaming requires model {REALTIME_MODEL!r} or "
+            f"{STREAMING_MODELS[1]!r}, not {model!r}"
+        )
+
     # An empty language code means "detect it". fcitx5-configtool writes that as
     # the empty string, but a hand-edited file may say "auto" (the config page's
     # own wording); accepting both keeps the two spellings interchangeable and
@@ -145,6 +176,7 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
         backend=backend,
         socket_path=socket_path,
         max_duration_s=max_duration_s,
+        streaming=streaming,
         config_path=str(config_path),
     )
 
@@ -213,6 +245,16 @@ def _integer(section: Mapping[str, Any], key: str, default: int, label: str) -> 
         return default
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{label} must be an integer, got {type(value).__name__}")
+    return value
+
+
+def _boolean(section: Mapping[str, Any], key: str, default: bool, label: str) -> bool:
+    """Fetch a boolean option, rejecting wrong types (and integers)."""
+    value = section.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be a boolean, got {type(value).__name__}")
     return value
 
 
