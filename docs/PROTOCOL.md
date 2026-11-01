@@ -64,7 +64,7 @@ Six commands. `id` is a client-generated UUIDv4 in hex form and is required on e
 
 ## Server to client
 
-Five message types.
+Six message types.
 
 ### `state`
 
@@ -100,6 +100,25 @@ State messages are broadcast to every connected client whenever the daemon's sta
 An empty transcript is a legal, successful outcome — silence, a muted microphone, or noise the model declines to transcribe all produce `result` with `"text": ""`. The client decides what to do with it; the addon commits nothing in that case. A result is never replaced by an error once it has been sent.
 
 `result` is delivered only to the owner of the recording (see below), never broadcast.
+
+### `partial`
+
+```json
+{"v":1,"type":"partial","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31","text":"नमस्ते दुनिया"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | integer | Protocol version, `1`. |
+| `type` | string | `partial`. |
+| `id` | string | The `id` of the `start` (or `toggle`-that-started) command that began the recording. |
+| `text` | string | The latest partial transcript for the whole recording so far, already whitespace-stripped. Never empty. |
+
+`partial` exists only while a streaming recording is in progress — that is, when `[api] streaming` is on — and carries the interim text the realtime service has recognised so far. The addon shows it through the recording indicator, which is what makes push-to-talk feel live: the words appear while the user is still speaking. The `text` is cumulative, not incremental: it is the whole recording up to that moment, so a client replaces what it is displaying rather than appending to it, and a client that misses one `partial` loses nothing but a frame. It carries the `id` of the `start` that began the recording, not of the `stop` that ends it, so a client with more than one session in its history can match a partial to the session it belongs to.
+
+It is delivered only to the owner of the recording, never broadcast, and it is throttled: the daemon sends at most one `partial` per 100 ms, about ten per second, and always delivers the last text it has seen, so the client's view lags the service by no more than that interval. A partial identical to the one last sent is not sent again, which keeps a long pause from producing a run of identical frames; a client may therefore assume that each `partial` it receives differs from the previous one, and it must not assume any particular interval between them beyond that minimum.
+
+`partial` never replaces `result`. The final transcript still arrives as `result` with the `id` of the `stop` that ended the recording, carrying the `text`, `language_code`, `duration_ms` and `segments` fields it always carries, and it is sent once. A client that ignores `partial` entirely sees exactly the protocol it saw before streaming existed, which is why no new command was added: `start`, `stop`, `toggle` and `cancel` mean what they meant, and a streaming recording is started, stopped and cancelled with the same commands as a file-based one.
 
 ### `reloaded`
 
@@ -143,7 +162,7 @@ The only message with no `id` field and no `type`-specific payload.
 
 ## Ownership
 
-The connection that sends `start`, or a `toggle` that starts a recording, becomes the **owner** of that recording. `result` and `error` for that recording go to the owner connection only, even when several clients are connected and even though the state changes were broadcast to all of them.
+The connection that sends `start`, or a `toggle` that starts a recording, becomes the **owner** of that recording. `result`, `partial` and `error` for that recording go to the owner connection only, even when several clients are connected and even though the state changes were broadcast to all of them.
 
 Ownership ends the moment the result or error is delivered. After that, any client may start a new recording.
 
@@ -218,6 +237,22 @@ S: {"v":1,"type":"state","state":"idle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
 ```
 
 The `reload` right after the connect is the addon catching the daemon up with `config.toml`: the addon had read the file, and the daemon may have been running since before the last change. The answer is `reloaded`, with no `state` line in between, because a reload is not a transition. The first `toggle` then starts the recording and makes this connection its owner; the resulting `state` carries that command's `id`. The second `toggle` stops it, producing a `transcribing` state, then the `result`, then the `idle` state as the daemon returns to rest. The addon commits `text` to the input context it captured at the first press, appends a space, and closes the "Transcribing…" notification when the `idle` arrives.
+
+A streaming recording is the same session with `partial` frames in the middle. With `[api] streaming` on, the daemon transcribes while the audio arrives and forwards the interim text to the owner:
+
+```
+C: {"v":1,"cmd":"toggle","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
+S: {"v":1,"type":"state","state":"recording","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31"}
+S: {"v":1,"type":"partial","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31","text":"नमस्ते"}
+S: {"v":1,"type":"partial","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31","text":"नमस्ते, मैं"}
+S: {"v":1,"type":"partial","id":"3f2a9c1e8b4d47a6b0e5c2d19f7a6b31","text":"नमस्ते, मैं ठीक"}
+C: {"v":1,"cmd":"toggle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
+S: {"v":1,"type":"state","state":"transcribing","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
+S: {"v":1,"type":"result","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60","text":"नमस्ते, मैं ठीक हूँ।","language_code":"hi-IN","duration_ms":2140,"segments":1}
+S: {"v":1,"type":"state","state":"idle","id":"7c1d0a4f2e6b48c39a5d8e3f1b2c7a60"}
+```
+
+The three `partial` frames carry the `id` of the `toggle` that started the recording, which is how the addon knows they belong to the session it opened, and each `text` is longer than the one before because the text is cumulative. The stop is an ordinary `toggle` and produces the same three messages as the non-streaming session — `transcribing`, `result`, `idle` — so nothing about the end of a recording differs between the two paths. The final `text` is longer than the last `partial` because the closing words are recognised when the utterance ends, and they arrive with the `result`. A second connection watching the same daemon sees the two `state` lines and none of the `partial` lines.
 
 A reload can also arrive in the middle of a recording, which is what happens when the user presses *Apply* in the configuration page while dictating. Nothing about the recording changes:
 
