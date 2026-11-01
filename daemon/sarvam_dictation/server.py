@@ -10,13 +10,21 @@ from disk and apply it to *future* work. The settings of a job that is already
 recording or transcribing are snapshotted when it starts, so a reload can never
 change the audio settings or the API call of work in flight.
 
-Brief 7 adds a second recording path, chosen per job by ``config.streaming``.
-When it is on, audio is fed to Sarvam's realtime WebSocket API as it is
-captured and interim ``partial`` messages reach the owner while the user is
-still speaking; the final transcript still arrives as ``result``. The two
-paths share one state machine: the same owner, the same ``busy`` replies, the
-same cancel semantics, and the same ``result``/``error`` delivery. Only the
-work behind ``start``, ``stop`` and ``cancel`` differs.
+Brief 7 adds a second recording path, chosen per job. When it is on, audio is
+fed to Sarvam's realtime WebSocket API as it is captured and interim
+``partial`` messages reach the owner while the user is still speaking; the
+final transcript still arrives as ``result``. The two paths share one state
+machine: the same owner, the same ``busy`` replies, the same cancel
+semantics, and the same ``result``/``error`` delivery. Only the work behind
+``start``, ``stop`` and ``cancel`` differs.
+
+Brief 15 makes that choice per dictation mode, and the protocol already
+carries the mode: ``start`` is the push-to-talk shape (hold the key, release
+to stop) and ``toggle`` is the record-and-send shape (press to begin, press
+again to finish). Both land in :meth:`DictationServer._cmd_start`, which is
+told which one it is by its ``push_to_talk`` argument and picks
+``config.streaming_push_to_talk`` or ``config.streaming_toggle`` accordingly.
+No protocol field is added; the command name is the mode.
 """
 
 from __future__ import annotations
@@ -458,12 +466,15 @@ class DictationServer:
             return
 
         if command == "start":
-            await self._cmd_start(client, msg_id)
+            # ``start``/``stop`` is the push-to-talk shape (brief 15).
+            await self._cmd_start(client, msg_id, push_to_talk=True)
         elif command == "stop":
             await self._cmd_stop(client, msg_id)
         elif command == "toggle":
+            # ``toggle`` is the record-and-send shape (brief 15): the first one
+            # starts a recording, the next one stops it.
             if self._state == STATE_IDLE:
-                await self._cmd_start(client, msg_id)
+                await self._cmd_start(client, msg_id, push_to_talk=False)
             else:
                 await self._cmd_stop(client, msg_id)
         elif command == RELOAD_COMMAND:
@@ -471,13 +482,23 @@ class DictationServer:
         else:  # cancel
             await self._cmd_cancel(client, msg_id)
 
-    async def _cmd_start(self, client: _Client, msg_id: str) -> None:
-        """Begin recording, making ``client`` the owner of the new recording."""
+    async def _cmd_start(self, client: _Client, msg_id: str, *, push_to_talk: bool) -> None:
+        """Begin recording, making ``client`` the owner of the new recording.
+
+        ``push_to_talk`` says which dictation shape asked for it, because the
+        protocol does not carry a separate mode field (brief 15): ``True`` for
+        ``start`` (hold the key, ``stop`` on release) and ``False`` for
+        ``toggle`` (record and send). It selects that mode's streaming switch
+        and nothing else; the rest of the start path is identical.
+        """
         async with self._lock:
             if self._state != STATE_IDLE:
                 await self._send(client, error_msg("busy", f"daemon is {self._state}", msg_id))
                 return
-            if self._config.streaming:
+            streaming = (
+                self._config.streaming_push_to_talk if push_to_talk else self._config.streaming_toggle
+            )
+            if streaming:
                 # The live path owns its own bookkeeping (snapshot, owner,
                 # state and broadcast) and the same auto-stop timer.
                 if await self._start_streaming(client, msg_id):

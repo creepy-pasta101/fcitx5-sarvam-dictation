@@ -176,28 +176,33 @@ def _run_check(config: Config, config_path: Path | None, socket_override: str | 
         problems.append("no API key")
 
     print(f"model:        {config.model}")
-    print(f"streaming:    {'on (realtime websocket)' if config.streaming else 'off (one request per recording)'}")
 
-    # Brief 8: name the endpoint this configuration will actually talk to and
-    # check the model against that endpoint's namespace, so a mismatch is one
-    # line here instead of the provider's HTTP 400 later.
-    if config.streaming:
-        endpoint = "realtime websocket"
-        allowed = STREAMING_MODELS
-    else:
-        endpoint = "REST /speech-to-text"
-        allowed = REST_MODELS
-    print(f"endpoint:     {endpoint}")
-    if config.model not in allowed:
-        if config.streaming:
+    # Brief 15: each dictation mode chooses its own transport, so both are
+    # reported with the endpoint they will use. ``start``/``stop`` is the
+    # push-to-talk shape and reads ``[api] streaming_push_to_talk``; ``toggle``
+    # is the record-and-send shape and reads ``[api] streaming_toggle``.
+    modes = (
+        (PUSH_TO_TALK_LABEL, config.streaming_push_to_talk),
+        (RECORD_AND_SEND_LABEL, config.streaming_toggle),
+    )
+    print(f"streaming:    {_describe_streaming(modes)}")
+
+    # Brief 8: name the endpoint each mode will actually talk to and check the
+    # model against that endpoint's namespace, so a mismatch is one line here
+    # instead of the provider's HTTP 400 later. Brief 15 makes the check
+    # per mode, and the problem names the mode that is misconfigured.
+    print(f"endpoint:     {_describe_endpoints(modes)}")
+    for label, streaming in modes:
+        if streaming:
+            if config.model not in STREAMING_MODELS:
+                problems.append(
+                    f"model {config.model!r} cannot be used with streaming in {label} mode; "
+                    f"use {STREAMING_MODELS[0]} or {STREAMING_MODELS[1]}"
+                )
+        elif config.model not in REST_MODELS:
             problems.append(
-                f"model {config.model!r} cannot be used with streaming; "
-                f"use {STREAMING_MODELS[0]} or {STREAMING_MODELS[1]}"
-            )
-        else:
-            problems.append(
-                f"model {config.model!r} cannot be used with REST /speech-to-text; "
-                f"use {_or_list(REST_MODELS)}"
+                f"model {config.model!r} cannot be used with REST /speech-to-text in "
+                f"{label} mode; use {_or_list(REST_MODELS)}"
             )
 
     print(f"mode:         {config.mode}")
@@ -221,6 +226,29 @@ def _run_check(config: Config, config_path: Path | None, socket_override: str | 
         return 1
     print("result:       OK")
     return 0
+
+
+#: The two dictation modes as ``--check`` names them, in the order it reports
+#: them. They are the user-facing names of the ``start``/``stop`` and ``toggle``
+#: command shapes (brief 15).
+PUSH_TO_TALK_LABEL = "push-to-talk"
+RECORD_AND_SEND_LABEL = "record-and-send"
+
+
+def _describe_streaming(modes: tuple[tuple[str, bool], ...]) -> str:
+    """One line saying, per dictation mode, whether it streams or batches."""
+    return ", ".join(
+        f"{label} {'on (realtime websocket)' if streaming else 'off (one request per recording)'}"
+        for label, streaming in modes
+    )
+
+
+def _describe_endpoints(modes: tuple[tuple[str, bool], ...]) -> str:
+    """One line naming, per dictation mode, the endpoint it will talk to."""
+    return ", ".join(
+        f"{label} {'realtime websocket' if streaming else 'REST /speech-to-text'}"
+        for label, streaming in modes
+    )
 
 
 def _or_list(names: tuple[str, ...]) -> str:

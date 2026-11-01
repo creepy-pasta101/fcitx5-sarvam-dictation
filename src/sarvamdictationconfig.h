@@ -194,12 +194,18 @@ FCITX_CONFIGURATION(
     Option<std::string> apiKey{this, "ApiKey", _("Sarvam API key"), ""};
     OptionWithAnnotation<DictationModel, DictationModelI18NAnnotation> model{
         this, "Model", _("Model"), DictationModel::SaarasV4};
-    // Off by default: the REST path stays the default. Only the realtime
-    // models have a streaming endpoint, and the daemon forces this on for
-    // saaras:v3-realtime regardless of the stored value.
-    Option<bool> streaming{
-        this, "Streaming",
-        _("Stream audio while recording (realtime models)"), false};
+    // Off by default: the REST path stays the default, and the two dictation
+    // modes are configured independently, because the protocol already tells
+    // them apart -- push-to-talk sends start/stop, record-and-send sends
+    // toggle. Only the realtime models have a streaming endpoint, and the
+    // daemon forces both of these on for saaras:v3-realtime regardless of the
+    // stored values.
+    Option<bool> streamingPushToTalk{
+        this, "StreamingPushToTalk",
+        _("Stream audio while the push-to-talk key is held"), false};
+    Option<bool> streamingToggle{
+        this, "StreamingToggle",
+        _("Stream audio in record-and-send mode"), false};
     OptionWithAnnotation<DictationMode, DictationModeI18NAnnotation> mode{
         this, "Mode", _("Output mode"), DictationMode::Transcribe};
     OptionWithAnnotation<DictationLanguage, DictationLanguageI18NAnnotation>

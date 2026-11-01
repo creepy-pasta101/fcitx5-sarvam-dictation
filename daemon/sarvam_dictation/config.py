@@ -21,6 +21,16 @@ clients with three disjoint model lists (REST, legacy streaming and realtime);
 :data:`REST_MODELS`, and ``saaras:v4`` is the one model every endpoint accepts.
 The daemon checks the configured model against the endpoint it is about to use
 rather than letting the provider answer with an HTTP 400.
+
+Brief 15 splits the single ``[api] streaming`` switch into one switch per
+dictation mode: ``[api] streaming_push_to_talk`` for the hold-the-key shape
+(``start``/``stop``) and ``[api] streaming_toggle`` for the record-and-send
+shape (``toggle``). Precedence per mode is the per-mode key, then the legacy
+``[api] streaming`` key, then false, so an existing ``config.toml`` that says
+``streaming = true`` keeps streaming *both* modes instead of silently dropping
+the user to batch. The realtime-only model still forces both modes on, and the
+model check is applied per mode so the error message can name the mode that is
+misconfigured.
 """
 
 from __future__ import annotations
@@ -42,11 +52,22 @@ DEFAULT_BACKEND = "auto"
 DEFAULT_MAX_DURATION_S = 300
 
 #: The realtime model (brief 7). It exists only on the WebSocket endpoint, so
-#: choosing it implies ``streaming = true``.
+#: choosing it implies streaming on for *both* dictation modes (brief 15).
 REALTIME_MODEL = "saaras:v3-realtime"
 
+#: The ``[api]`` key that enables streaming for each dictation mode, in the
+#: order the daemon and ``--check`` report them (brief 15). The key name is
+#: also the mode name every error message uses.
+STREAMING_PUSH_TO_TALK_KEY = "streaming_push_to_talk"
+STREAMING_TOGGLE_KEY = "streaming_toggle"
+STREAMING_KEYS = (STREAMING_PUSH_TO_TALK_KEY, STREAMING_TOGGLE_KEY)
+
+#: The legacy single switch (brief 7). It still applies to both modes when a
+#: per-mode key is absent, so an old ``config.toml`` keeps working.
+LEGACY_STREAMING_KEY = "streaming"
+
 #: The models the realtime endpoint serves, and therefore the only models that
-#: may be combined with ``[api] streaming = true``.
+#: may be combined with any of the streaming switches being on.
 STREAMING_MODELS = (REALTIME_MODEL, "saaras:v4")
 
 #: Models the REST endpoint POST /speech-to-text accepts. saaras:v3-realtime is
@@ -83,9 +104,13 @@ class Config:
     socket_path: str = ""
     max_duration_s: int = DEFAULT_MAX_DURATION_S
     #: Transcribe while recording through the realtime WebSocket API instead of
-    #: sending one WAV to the REST endpoint at the end. Off by default: the REST
-    #: path is the default and needs no realtime subscription.
-    streaming: bool = False
+    #: sending one WAV to the REST endpoint at the end, chosen independently for
+    #: each dictation mode (brief 15). ``streaming_push_to_talk`` covers the
+    #: hold-the-key shape (``start``/``stop``), ``streaming_toggle`` the
+    #: record-and-send shape (``toggle``). Both default to off: the REST path is
+    #: the default and needs no realtime subscription.
+    streaming_push_to_talk: bool = False
+    streaming_toggle: bool = False
     #: The file this configuration was read from; ``""`` when it was built by
     #: hand. It takes no part in equality, hashing or ``repr``, so every
     #: ``Config(...)`` comparison written before brief 2 keeps working.
@@ -136,18 +161,27 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
     if mode not in VALID_MODES:
         raise ConfigError(f"[api] mode {mode!r} is not one of {', '.join(VALID_MODES)}")
 
-    # Streaming is opt-in, with two rules (brief 7): the realtime model has no
-    # REST equivalent so it forces streaming on, and streaming with a model the
-    # realtime endpoint does not serve is a configuration error rather than a
-    # silent downgrade to REST.
-    streaming = _boolean(api, "streaming", False, "[api] streaming")
+    # Streaming is opt-in per dictation mode (brief 15), with two rules carried
+    # over from brief 7: the realtime model has no REST equivalent so it forces
+    # streaming on for both modes, and streaming with a model the realtime
+    # endpoint does not serve is a configuration error - naming the mode that
+    # asked for it - rather than a silent downgrade to REST.
+    legacy_streaming = _boolean(api, LEGACY_STREAMING_KEY, False, "[api] streaming")
+    streaming_push_to_talk = _streaming_flag(api, STREAMING_PUSH_TO_TALK_KEY, legacy_streaming)
+    streaming_toggle = _streaming_flag(api, STREAMING_TOGGLE_KEY, legacy_streaming)
     if model == REALTIME_MODEL:
-        streaming = True
-    elif streaming and model not in STREAMING_MODELS:
-        raise ConfigError(
-            f"[api] streaming requires model {REALTIME_MODEL!r} or "
-            f"{STREAMING_MODELS[1]!r}, not {model!r}"
-        )
+        streaming_push_to_talk = True
+        streaming_toggle = True
+    else:
+        for key, enabled in (
+            (STREAMING_PUSH_TO_TALK_KEY, streaming_push_to_talk),
+            (STREAMING_TOGGLE_KEY, streaming_toggle),
+        ):
+            if enabled and model not in STREAMING_MODELS:
+                raise ConfigError(
+                    f"[api] {key} requires model {REALTIME_MODEL!r} or "
+                    f"{STREAMING_MODELS[1]!r}, not {model!r}"
+                )
 
     # An empty language code means "detect it". fcitx5-configtool writes that as
     # the empty string, but a hand-edited file may say "auto" (the config page's
@@ -188,7 +222,8 @@ def load_config(path: Path | None = None, env: Mapping[str, str] | None = None) 
         backend=backend,
         socket_path=socket_path,
         max_duration_s=max_duration_s,
-        streaming=streaming,
+        streaming_push_to_talk=streaming_push_to_talk,
+        streaming_toggle=streaming_toggle,
         config_path=str(config_path),
     )
 
@@ -268,6 +303,19 @@ def _boolean(section: Mapping[str, Any], key: str, default: bool, label: str) ->
     if not isinstance(value, bool):
         raise ConfigError(f"{label} must be a boolean, got {type(value).__name__}")
     return value
+
+
+def _streaming_flag(api: Mapping[str, Any], key: str, legacy: bool) -> bool:
+    """Read one per-mode streaming switch, falling back to the legacy key.
+
+    Precedence is the per-mode key when the file sets it, else the legacy
+    ``[api] streaming`` value, else false. ``legacy`` is already resolved by
+    the caller, so an absent per-mode key simply inherits it; a per-mode key
+    that is present always wins, in both directions.
+    """
+    if key in api:
+        return _boolean(api, key, legacy, f"[api] {key}")
+    return legacy
 
 
 def _keyterms(api: Mapping[str, Any]) -> tuple[str, ...]:
