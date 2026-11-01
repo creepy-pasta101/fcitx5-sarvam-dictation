@@ -3,6 +3,11 @@
 Installed as the ``sarvam-dictation-daemon`` console script; the package is
 also runnable with the interpreter's ``-m`` switch. Logs go to stderr, and
 SIGINT/SIGTERM shut the socket down cleanly.
+
+``--list-audio-devices`` is the one mode that does not start the server: it
+prints the capture devices found on this machine as ``id<TAB>label`` lines and
+exits 0, without reading the config or checking the API key, so the
+configuration page can offer a dropdown.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from .config import (
     default_socket_path,
     load_config,
 )
+from .devices import format_device_list, list_devices
 from .recorder import RecorderError, detect_backend
 from .server import DictationServer
 
@@ -54,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate config, audio backend and API key, print a report and exit",
     )
     parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="print the capture devices found on this machine as id<TAB>label "
+        "lines and exit (no config is read and the server is not started)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"sarvam-dictation-daemon {__version__}",
@@ -64,6 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the daemon; returns a process exit status."""
     args = build_parser().parse_args(argv)
+
+    # Brief 9: the configuration page calls this to fill its device dropdown.
+    # It must work with no config file, no API key and no audio server, so it
+    # runs before logging, before load_config() and before the server exists.
+    if args.list_audio_devices:
+        return _run_list_audio_devices()
+
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format=LOG_FORMAT,
@@ -120,6 +139,24 @@ async def _serve(config: Config, socket_path: str | None) -> None:
             task.cancel()
         await asyncio.gather(serve_task, stop_task, return_exceptions=True)
         await server.shutdown()
+
+
+def _run_list_audio_devices() -> int:
+    """Print ``id<TAB>label`` for every capture device and return 0.
+
+    An empty list prints nothing and still succeeds: a machine with no sound
+    card is a valid answer, not an error, and the caller renders its own
+    "System default" entry either way.
+    """
+    text = format_device_list(list_devices("auto"))
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        # A closed pipe (output piped into head) or a detached stdout must not
+        # produce a traceback: the list is advisory output.
+        return 0
+    return 0
 
 
 def _run_check(config: Config, config_path: Path | None, socket_override: str | None) -> int:

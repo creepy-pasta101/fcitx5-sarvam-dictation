@@ -171,6 +171,23 @@ SARVAM_DICTATION_ENUM_LABELS(DictationBackend, N_("Auto-detect"),
                              N_("PipeWire (pw-record)"),
                              N_("PulseAudio (parec)"), N_("ALSA (arecord)"));
 
+/*
+ * Presents the free-form device string as a dropdown of the devices that exist
+ * on this machine. fcitx5-configtool builds a combobox from Type=Enum plus the
+ * Enum/N and EnumI18n/N description entries, and Option::dumpDescription calls
+ * the constrain after it has set Type, so a runtime-generated list works.
+ *
+ * The constrain stores nothing: Type is std::string and check() accepts every
+ * value, because a device may be temporarily absent (an unplugged headset) and
+ * the setting must survive that. The definition of dumpDescription lives in
+ * audiodevices.cpp, next to the enumeration it prints.
+ */
+struct AudioDeviceConstrain {
+    using Type = std::string;
+    bool check(const std::string & /*unused*/) const { return true; }
+    void dumpDescription(RawConfig &config) const;
+};
+
 FCITX_CONFIGURATION(
     SarvamDictationConfig,
     // ---- Daemon settings, stored in ~/.config/sarvam-dictation/config.toml --
@@ -191,7 +208,9 @@ FCITX_CONFIGURATION(
     Option<std::vector<std::string>> keyterms{
         this, "Keyterms", _("Keyterms (saaras:v4 only, max 50)"),
         std::vector<std::string>()};
-    Option<std::string> audioDevice{
+    // The value is still a plain std::string: only its presentation changes, so
+    // sarvamdictationconfig.cpp keeps reading and writing audio.device as text.
+    Option<std::string, AudioDeviceConstrain> audioDevice{
         this, "AudioDevice", _("Audio device (empty = default source)"), ""};
     OptionWithAnnotation<DictationSampleRate, DictationSampleRateI18NAnnotation>
         sampleRate{this, "SampleRate", _("Sample rate"),

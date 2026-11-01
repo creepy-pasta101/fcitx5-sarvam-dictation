@@ -90,6 +90,14 @@ constexpr uint64_t kPushToTalkMinHoldUsec = 250 * 1000;
 /// expire-time and as the fcitx5 tip timeout. Errors are rare and are the one
 /// message that has to be noticed, so it may linger.
 constexpr int32_t kErrorNotificationTimeoutMs = 10000;
+/// Trailing-edge interval for the partial transcript. The daemon throttles
+/// partials to roughly ten a second; holding the newest one this long keeps
+/// the newest text while cutting the forked D-Bus clients to about three a
+/// second. It also stops Plasma restarting the OSD's fade-in on every partial.
+constexpr uint64_t kPartialIntervalUsec = 350 * 1000;
+/// Longest partial text handed to the indicator, in bytes. A longer one keeps
+/// its tail, because the newest words are the ones being spoken.
+constexpr size_t kMaxPartialBytes = 120;
 
 #ifdef MSG_NOSIGNAL
 // A daemon that dies mid-write must not kill fcitx5 with SIGPIPE.
@@ -119,6 +127,73 @@ void appendUtf8(uint32_t codePoint, std::string &out) {
         out.push_back(static_cast<char>(0x80u | ((codePoint >> 6) & 0x3Fu)));
         out.push_back(static_cast<char>(0x80u | (codePoint & 0x3Fu)));
     }
+}
+
+/// Normalise a partial transcript for the one-line indicator.
+///
+/// Every run of whitespace (space, tab, newline, carriage return) becomes a
+/// single space, every other control character is dropped, and the result is
+/// trimmed. A partial that is nothing but noise therefore sanitises to the
+/// empty string, which the caller treats as "show nothing".
+///
+/// The scan is byte-wise, which is safe for the Devanagari and other
+/// multi-byte transcripts the service returns: every byte of a multi-byte
+/// UTF-8 sequence is 0x80 or above, so neither the whitespace test nor the
+/// control-character test can match inside one.
+std::string sanitisePartialText(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool pendingSpace = false;
+    for (const char raw : text) {
+        const unsigned char byte = static_cast<unsigned char>(raw);
+        if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r') {
+            // Never emit a leading space, and let a run collapse: the space is
+            // written out only when a real character follows it.
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (byte < 0x20u || byte == 0x7Fu) {
+            continue;
+        }
+        if (pendingSpace) {
+            out.push_back(' ');
+            pendingSpace = false;
+        }
+        out.push_back(raw);
+    }
+    // A pending space at the end is the trailing whitespace of the trim.
+    return out;
+}
+
+/// Keep the newest words of a partial: at most kMaxPartialBytes bytes, cut on
+/// a UTF-8 code-point boundary, prefixed with "..." when the head was
+/// dropped.
+std::string capPartialTail(const std::string &text) {
+    if (text.size() <= kMaxPartialBytes) {
+        return text;
+    }
+    size_t start = text.size() - kMaxPartialBytes;
+    // 0b10xxxxxx is a continuation byte, the middle of a code point. Step
+    // forward to the start of the next one: cutting mid-sequence would put
+    // mojibake in the indicator instead of a truncated word.
+    while (start < text.size() &&
+           (static_cast<unsigned char>(text[start]) & 0xC0u) == 0x80u) {
+        ++start;
+    }
+    while (start < text.size() && text[start] == ' ') {
+        ++start;
+    }
+    std::string out;
+    out.reserve(text.size() - start + 3);
+    out += "...";
+    if (start >= text.size()) {
+        // Only reachable if the tail is nothing but continuation bytes, which
+        // valid UTF-8 cannot produce. Show the ellipsis alone rather than
+        // returning text longer than the cap.
+        return out;
+    }
+    out.append(text, start, std::string::npos);
+    return out;
 }
 
 /// A minimal, allocation-free cursor over one JSON document.
@@ -617,6 +692,21 @@ SarvamDictation::SarvamDictation(Instance *instance) : instance_(instance) {
         retryTimer_->setEnabled(false);
     }
 
+    // The partial transcript gets its own trailing-edge timer, created the same
+    // way and with the same two failure modes handled: a backend that throws
+    // EventLoopException, and one that returns a null source. A missing timer
+    // is not fatal -- handleLine() falls back to showing a partial at once.
+    try {
+        partialTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 0,
+            [this](EventSourceTime *, uint64_t) { return onPartialTimer(); });
+    } catch (const EventLoopException &) {
+        partialTimer_.reset();
+    }
+    if (partialTimer_) {
+        partialTimer_->setEnabled(false);
+    }
+
     reloadConfig();
 }
 
@@ -784,6 +874,9 @@ void SarvamDictation::endPushToTalk() {
         FCITX_SARVAMDICTATION_DEBUG()
             << "push-to-talk released after " << heldUsec
             << " us, last state '" << lastState_ << "', sending cancel";
+        // A cancelled recording leaves nothing worth showing, and its partial
+        // must not surface on top of whatever comes next.
+        clearPartialDisplay();
         queueCommand("{\"v\":1,\"cmd\":\"cancel\",\"id\":\"" + id + "\"}");
         return;
     }
@@ -1072,18 +1165,32 @@ void SarvamDictation::handleLine(std::string_view line) {
     }
 
     if (message.type == "partial") {
-        // A live partial transcript of the recording in progress: it goes
-        // straight to the indicator, so on Plasma the OSD follows the speaker
-        // while the key is held. It can arrive ten times a second, so this
-        // path builds no notification, logs nothing and returns before doing
-        // any work when the text is the one already on screen. An empty text
-        // is ignored rather than used to blank the OSD.
-        if (message.text.empty() || message.text == lastPartial_) {
+        // A live partial transcript of the recording in progress. It is not
+        // shown here: it arrives about ten times a second, every indicator
+        // update forks a D-Bus client, and Plasma restarts the OSD's fade-in
+        // on each call, so showing each one makes the indicator flash. The
+        // text is sanitised, capped to its newest words and kept in
+        // pendingPartial_, and the trailing-edge timer shows it at most about
+        // three times a second with the newest text always landing. This path
+        // builds no notification and logs nothing.
+        const std::string text =
+            capPartialTail(sanitisePartialText(message.text));
+        if (text.empty()) {
+            // Nothing but whitespace or control characters. Show nothing, and
+            // leave lastShownPartial_ untouched so a later identical redraw is
+            // still suppressed.
             return;
         }
-        lastPartial_ = message.text;
-        showRecordingIndicator(kAppIcon, lastPartial_,
-                               _("Release the key to finish."));
+        pendingPartial_ = text;
+        if (!partialTimer_) {
+            // The event loop refused the timer, so there is no trailing edge
+            // to wait for: show it now rather than lose the indicator.
+            onPartialTimer();
+            return;
+        }
+        if (!partialTimerArmed_) {
+            armPartialTimer();
+        }
         return;
     }
 
@@ -1093,8 +1200,9 @@ void SarvamDictation::handleLine(std::string_view line) {
         // reads it; see endPushToTalk().
         lastState_ = message.state;
         // Whatever partial was on screen described the recording that just
-        // ended, so the next one starts from a clean slate.
-        lastPartial_.clear();
+        // ended, so the next one starts from a clean slate: the pending text,
+        // the timer and the remembered text all go.
+        clearPartialDisplay();
         if (message.state == "recording") {
             showRecordingIndicator(kAppIcon, _("Listening"),
                                    _("Press the hotkey again to stop."));
@@ -1111,7 +1219,7 @@ void SarvamDictation::handleLine(std::string_view line) {
 
     if (message.type == "result") {
         // The final transcript supersedes any partial of this recording.
-        lastPartial_.clear();
+        clearPartialDisplay();
         // Only act on a transcript we asked for. An empty id cannot be matched
         // and is accepted, because a daemon that lost its id is still telling
         // us about the recording we started.
@@ -1278,6 +1386,44 @@ bool SarvamDictation::onRetryTimer() {
     }
     reportUnreachable();
     return false;
+}
+
+void SarvamDictation::armPartialTimer() {
+    if (!partialTimer_) {
+        return;
+    }
+    partialTimer_->setTime(now(CLOCK_MONOTONIC) + kPartialIntervalUsec);
+    partialTimer_->setOneShot();
+    partialTimer_->setEnabled(true);
+    partialTimerArmed_ = true;
+}
+
+bool SarvamDictation::onPartialTimer() {
+    // Disarm before showing anything: showRecordingIndicator() runs D-Bus
+    // code, and the next partial must be able to arm a fresh timer even if it
+    // arrives while that runs.
+    partialTimerArmed_ = false;
+    if (partialTimer_) {
+        partialTimer_->setEnabled(false);
+    }
+    if (pendingPartial_.empty() || pendingPartial_ == lastShownPartial_) {
+        return false;
+    }
+    // Remember the text before showing it, so an identical partial that
+    // arrives afterwards costs nothing.
+    lastShownPartial_ = pendingPartial_;
+    showRecordingIndicator(kAppIcon, lastShownPartial_,
+                           _("Release the key to finish."));
+    return false;
+}
+
+void SarvamDictation::clearPartialDisplay() {
+    pendingPartial_.clear();
+    lastShownPartial_.clear();
+    partialTimerArmed_ = false;
+    if (partialTimer_) {
+        partialTimer_->setEnabled(false);
+    }
 }
 
 void SarvamDictation::reportUnreachable() {
