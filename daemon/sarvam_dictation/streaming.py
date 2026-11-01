@@ -19,6 +19,12 @@ Two properties shape the implementation:
   for as long as the session is open; :meth:`cancel` always joins it, so a
   cancelled session never leaves a task behind.
 
+Brief 8 adds the model guard: the realtime endpoint serves its own namespace
+(:data:`~sarvam_dictation.config.STREAMING_MODELS`), so :meth:`open` refuses a
+model outside it with ``config_invalid`` before any socket work. Nothing here
+substitutes a different model - the configured one is sent verbatim or the
+session does not start.
+
 Every SDK call made here is checked against ``sarvamai`` 0.1.41:
 ``speech_to_text_realtime_streaming.connect()`` is an ``@asynccontextmanager``
 taking ``language_code`` (required), ``model``, ``mode``, ``encoding``,
@@ -42,16 +48,17 @@ import socket
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .config import Config
+from .config import STREAMING_MODELS, Config
 
 logger = logging.getLogger(__name__)
 
-#: Models the realtime endpoint accepts (brief section "Configuration").
-REALTIME_MODELS = ("saaras:v3-realtime", "saaras:v4")
-
-#: Used when the configured model has no realtime equivalent (e.g. ``saaras:v4``
-#: is realtime-capable, but a REST-only model such as ``saaras:v3`` is not).
-DEFAULT_REALTIME_MODEL = "saaras:v3-realtime"
+#: Models the realtime endpoint accepts. Imported from :mod:`sarvam_dictation.
+#: config` rather than re-typed here, so ``config.py`` stays the one source of
+#: truth for the endpoint namespaces (brief 8). The tuple is the mirror image of
+#: ``REST_MODELS``: a REST-only model such as ``saaras:v3`` must never reach the
+#: realtime socket, and :meth:`RealtimeTranscriber.open` refuses it rather than
+#: substituting a model the user did not choose.
+REALTIME_MODELS = STREAMING_MODELS
 
 #: ``linear16`` is raw little-endian signed 16-bit PCM, mono, at ``sample_rate``.
 #: That is exactly what the capture tools write to their stdout, so the
@@ -113,8 +120,11 @@ _NETWORK_ERRNOS = frozenset(
 class StreamingError(Exception):
     """A streaming transcription failure.
 
-    ``code`` is one of ``no_api_key``, ``network``, ``api`` or ``internal`` -
-    the same vocabulary the protocol's ``error`` message uses.
+    ``code`` is one of ``no_api_key``, ``config_invalid``, ``network``, ``api``
+    or ``internal`` - the same vocabulary the protocol's ``error`` message uses.
+    ``config_invalid`` means the settings cannot be used with the realtime
+    endpoint at all (a REST-only model, for example), so the session is refused
+    before a socket is opened.
     """
 
     def __init__(self, message: str, code: str = "internal") -> None:
@@ -193,12 +203,25 @@ class RealtimeTranscriber:
     async def open(self) -> None:
         """Open the session.
 
-        Raises :class:`StreamingError` (``no_api_key``) before any client is
-        constructed when ``config.api_key`` is empty, so a misconfigured daemon
-        never opens a socket.
+        Raises :class:`StreamingError` (``config_invalid``) before any client is
+        constructed when the configured model is not one the realtime endpoint
+        serves, and (``no_api_key``) when ``config.api_key`` is empty: either
+        way a misconfigured daemon never opens a socket.
         """
         if self._ws is not None or self._finished or self._closed:
             return
+
+        if self._config.model not in STREAMING_MODELS:
+            # The mirror of the guard in transcriber.py: the realtime endpoint
+            # has its own model namespace, so a REST-only model is a
+            # configuration mistake rather than something to paper over by
+            # substituting a model the user never picked.
+            raise StreamingError(
+                f"model {self._config.model!r} cannot be used with streaming. "
+                f"Choose {STREAMING_MODELS[0]!r} or {STREAMING_MODELS[1]!r} for the "
+                f"realtime endpoint, or set [api] streaming = false to use REST.",
+                code="config_invalid",
+            )
 
         if not (self._config.api_key or "").strip():
             # Raised before any network work: the caller reports `no_api_key`.
@@ -448,8 +471,13 @@ class RealtimeTranscriber:
         )
 
     def _connect_kwargs(self) -> dict[str, Any]:
-        """Build the ``connect()`` keyword arguments for this configuration."""
-        model = self._config.model if self._config.model in REALTIME_MODELS else DEFAULT_REALTIME_MODEL
+        """Build the ``connect()`` keyword arguments for this configuration.
+
+        ``open()`` has already refused any model outside
+        :data:`~sarvam_dictation.config.STREAMING_MODELS`, so the configured
+        model is sent verbatim: this module never swaps in a different one.
+        """
+        model = self._config.model
         keyterms = None
         if self._config.keyterms and model == "saaras:v4":
             # The SDK wants a JSON-encoded array, and only saaras:v4 accepts them.
@@ -568,7 +596,6 @@ __all__ = [
     "DEFAULT_ENDPOINTING",
     "DEFAULT_ENCODING",
     "DEFAULT_LANGUAGE_CODE",
-    "DEFAULT_REALTIME_MODEL",
     "REALTIME_MODELS",
     "RealtimeTranscriber",
     "StreamingError",

@@ -13,6 +13,14 @@ WebSocket API while the user is still speaking. ``saaras:v3-realtime`` has no
 REST equivalent, so naming it forces streaming on; asking for streaming with a
 model that has no realtime support is rejected outright rather than silently
 falling back to REST.
+
+Brief 8 adds :data:`REST_MODELS` beside :data:`STREAMING_MODELS`, so both
+endpoints' model namespaces live in this one module. The SDK exposes three
+clients with three disjoint model lists (REST, legacy streaming and realtime);
+``saaras:v3-realtime`` is a realtime-only name and is deliberately absent from
+:data:`REST_MODELS`, and ``saaras:v4`` is the one model every endpoint accepts.
+The daemon checks the configured model against the endpoint it is about to use
+rather than letting the provider answer with an HTTP 400.
 """
 
 from __future__ import annotations
@@ -40,6 +48,10 @@ REALTIME_MODEL = "saaras:v3-realtime"
 #: The models the realtime endpoint serves, and therefore the only models that
 #: may be combined with ``[api] streaming = true``.
 STREAMING_MODELS = (REALTIME_MODEL, "saaras:v4")
+
+#: Models the REST endpoint POST /speech-to-text accepts. saaras:v3-realtime is
+#: deliberately absent: it exists only on the realtime WebSocket endpoint.
+REST_MODELS = ("saarika:v2.5", "saaras:v3", "saaras:v4")
 
 VALID_MODES = ("transcribe", "translate", "verbatim", "translit", "codemix")
 VALID_BACKENDS = ("auto", "pipewire", "pulse", "alsa")

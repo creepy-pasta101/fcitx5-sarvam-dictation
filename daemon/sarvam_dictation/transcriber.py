@@ -17,7 +17,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config
+from .config import DEFAULT_MODEL, REST_MODELS, Config
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,11 @@ _NETWORK_ERRNOS = frozenset(
 class TranscriptionError(Exception):
     """Raised when transcription fails.
 
-    ``code`` is one of ``no_api_key``, ``network``, ``api`` or ``internal``.
+    ``code`` is one of ``no_api_key``, ``config_invalid``, ``network``, ``api``
+    or ``internal``. ``config_invalid`` is a configuration mistake, not a
+    service failure: the model the user picked cannot be sent to the REST
+    endpoint at all, so the daemon says so instead of forwarding the request
+    and relaying the provider's HTTP 400.
     """
 
     def __init__(self, message: str, code: str = "internal") -> None:
@@ -163,7 +167,21 @@ class SarvamTranscriber:
         self._client = client
 
     def transcribe(self, path: Path) -> Transcript:
-        """Transcribe ``path``, splitting it into <=28 s chunks when needed."""
+        """Transcribe ``path``, splitting it into <=28 s chunks when needed.
+
+        The configured model is checked against the REST namespace first
+        (brief 8): a model the endpoint does not serve is a configuration
+        error, reported before any file is opened and before any client is
+        built, so the provider's ``Invalid model`` 400 is never seen.
+        """
+        if self._config.model not in REST_MODELS:
+            raise TranscriptionError(
+                f"model {self._config.model!r} only works on the realtime streaming "
+                f"endpoint, not on REST. Set [api] streaming = true to use it, or "
+                f"choose {DEFAULT_MODEL!r} for the REST endpoint.",
+                code="config_invalid",
+            )
+
         if not self._config.api_key:
             # Raised before any network work: the caller reports `no_api_key`.
             raise TranscriptionError(

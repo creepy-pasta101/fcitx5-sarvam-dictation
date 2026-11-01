@@ -18,6 +18,8 @@ from pathlib import Path
 from . import __version__
 from .config import (
     API_KEY_ENV,
+    REST_MODELS,
+    STREAMING_MODELS,
     Config,
     ConfigError,
     default_config_path,
@@ -138,6 +140,29 @@ def _run_check(config: Config, config_path: Path | None, socket_override: str | 
 
     print(f"model:        {config.model}")
     print(f"streaming:    {'on (realtime websocket)' if config.streaming else 'off (one request per recording)'}")
+
+    # Brief 8: name the endpoint this configuration will actually talk to and
+    # check the model against that endpoint's namespace, so a mismatch is one
+    # line here instead of the provider's HTTP 400 later.
+    if config.streaming:
+        endpoint = "realtime websocket"
+        allowed = STREAMING_MODELS
+    else:
+        endpoint = "REST /speech-to-text"
+        allowed = REST_MODELS
+    print(f"endpoint:     {endpoint}")
+    if config.model not in allowed:
+        if config.streaming:
+            problems.append(
+                f"model {config.model!r} cannot be used with streaming; "
+                f"use {STREAMING_MODELS[0]} or {STREAMING_MODELS[1]}"
+            )
+        else:
+            problems.append(
+                f"model {config.model!r} cannot be used with REST /speech-to-text; "
+                f"use {_or_list(REST_MODELS)}"
+            )
+
     print(f"mode:         {config.mode}")
     print(f"language:     {config.language_code or 'auto-detect'}")
     print(f"keyterms:     {len(config.keyterms)}")
@@ -159,6 +184,15 @@ def _run_check(config: Config, config_path: Path | None, socket_override: str | 
         return 1
     print("result:       OK")
     return 0
+
+
+def _or_list(names: tuple[str, ...]) -> str:
+    """Join ``names`` as ``a, b or c`` for the ``--check`` messages."""
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{', '.join(names[:-1])} or {names[-1]}"
 
 
 def _file_api_key(path: Path) -> str:
