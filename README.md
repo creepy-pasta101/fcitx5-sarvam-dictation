@@ -117,6 +117,17 @@ The page writes two files, because the two processes own different things:
 
 When you press *Apply*, the addon writes `config.toml` from the values on the page, then sends a `reload` command to the daemon over the socket. A running daemon re-reads the file and applies the new settings to the next recording — no restart of either process is needed.
 
+### Choosing an engine
+
+The *Engine* row picks which Sarvam API the daemon talks to, and the button beside it opens that engine's own page:
+
+* **Saaras** — speech-to-text: the model, the keyterms and the two streaming switches.
+* **Dictate** — finished text: the style, your formatting rules, the vocabulary, the context, a reference document, output rules, a pinned model and the stream type.
+
+Shared settings — the API key, the output mode, the language, the audio device, the sample rate, the capture backend, the socket path and the maximum length — stay on this page, because both engines use them. The button follows the combo: pick the other engine and it opens the other page. Both pages write into the same `config.toml`, so switching back and forth never loses the settings you left behind.
+
+This is why the page is built the way it is. fcitx5 has no way to hide a row conditionally — an option is either on the page or it is not, decided when the dialog opens — so the engine's own settings live on a sub-page instead of appearing and disappearing beside the shared ones.
+
 ### Daemon settings
 
 These are the settings the daemon reads from `~/.config/sarvam-dictation/config.toml`. Each one appears on the configuration page with the label in the first column.
@@ -139,7 +150,7 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 
 ### Dictate settings
 
-`[api] engine = "dictate"` switches the daemon from Saaras to Sarvam's Dictate API. Dictate returns the text a person meant to type rather than a transcript: punctuation, no fillers or false starts, digits instead of spoken numbers, and your names spelled your way. The settings below live in their own `[dictate]` table because they only mean anything to that engine; with `engine = "saaras"` they are read and ignored.
+`[api] engine = "dictate"` switches the daemon from Saaras to Sarvam's Dictate API. Dictate returns the text a person meant to type rather than a transcript: punctuation, no fillers or false starts, digits instead of spoken numbers, and your names spelled your way. These are the settings behind the *Configure* button when *Engine* is *Dictate*; in the file they live in their own `[dictate]` table, because they only mean anything to that engine — with `engine = "saaras"` they are read, validated and left alone.
 
 Dictate talks to Sarvam through the same `sarvamai` SDK as everything else, so there is nothing extra to install — but the SDK must be 0.1.49 or newer, the first release with the Dictate clients. Upgrade it for the interpreter the daemon runs under:
 

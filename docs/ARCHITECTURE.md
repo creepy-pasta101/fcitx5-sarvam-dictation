@@ -123,6 +123,30 @@ The obvious alternative was to let the page push values to the daemon over the s
 * **No second copy of the API key.** A socket-pushed configuration would either carry the key over the wire into the daemon's memory and a second persistence path, or need a separate mechanism for the one value that matters most. Keeping the key in the 0600 `config.toml` and nowhere else means there is exactly one file to protect and one file to audit.
 * **The daemon keeps working standalone.** The daemon has no dependency on fcitx5, on the addon, or on the socket being up in order to be configured. A user who installed only `pip install ./daemon` and runs it as a service edits `config.toml` and sends `reload`; the same loader serves both worlds, unchanged.
 
+### Why the engine has its own page
+
+fcitx5 offers no way to hide an option conditionally. `OptionBase` has no
+`setVisible`; the built-in `ConditionalHidden` takes a compile-time bool; and the
+page is only built when the dialog opens, so a row cannot appear or disappear as
+a combo changes. An option is on the page or it is not.
+
+What the generated page *does* support is a per-enum-value `SubConfigPath`: an
+enum whose annotation dumps `SubConfigPath/<i>` grows a *Configure* button that
+is shown for the selected value and follows the combo live. So the engine is an
+enum on the main page, and each engine's own settings live on their own generated
+page behind that button — `getSubConfig("saaras")` and `getSubConfig("dictate")`
+returning two separate `Configuration` objects. The page therefore shows exactly
+one engine's settings, without a Qt plugin, a second process, or a second config
+file.
+
+Two consequences are worth knowing. The sub-configurations are a UI fact, not a
+file-layout fact: `saveDaemonConfig` marshals all three objects into the one
+`config.toml`, and each page is marshalled through its own `RawConfig`, because
+both pages have an option at path `Model` and a shared one would feed the Saaras
+enum value into the Dictate string option. And `setConfig` must load partially —
+a page that is not open sends none of its keys, and a full load resets absent
+options to their defaults, which would silently wipe the other engine's settings.
+
 ### The flow
 
 1. `fcitx5-configtool` edits the addon's `Configuration` object. Both groups of options are in it: the daemon options are ordinary fcitx5 options that happen to be persisted elsewhere.
