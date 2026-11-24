@@ -32,6 +32,12 @@
  *    left alone. A typo in the TOML file would therefore silently revert a
  *    setting, which is why every value is validated here first: a bad value is
  *    reported as a load error and the config is left untouched.
+ *
+ * Three Configuration objects feed this one file -- the main page, the Saaras
+ * page and the Dictate page (see sarvamdictationconfig.h). Both engine groups
+ * are always read and always written whatever `[api] engine` says, so
+ * switching engines keeps the other engine's settings and a hand-written
+ * `[dictate]` table survives an Apply.
  */
 #include "sarvamdictationconfig.h"
 
@@ -62,6 +68,11 @@ namespace {
 // frozen table. They are used as the keys of the RawConfig that
 // loadDaemonConfig builds and that saveDaemonConfig reads back.
 constexpr char kApiKey[] = "ApiKey";
+constexpr char kEngine[] = "Engine";
+// "Model" is the path of two different options: the Saaras model enum and the
+// Dictate model string. They are options of two different Configuration
+// objects and loadDaemonConfig() gives each object its own RawConfig, so the
+// same path name cannot make them read each other's value.
 constexpr char kModel[] = "Model";
 constexpr char kMode[] = "Mode";
 constexpr char kStreaming[] = "Streaming";
@@ -74,6 +85,14 @@ constexpr char kSampleRate[] = "SampleRate";
 constexpr char kBackend[] = "Backend";
 constexpr char kSocketPath[] = "SocketPath";
 constexpr char kMaxDurationS[] = "MaxDurationS";
+// The Dictate page's options, i.e. the keys of the [dictate] table.
+constexpr char kStyle[] = "Style";
+constexpr char kRules[] = "Rules";
+constexpr char kVocabulary[] = "Vocabulary";
+constexpr char kContext[] = "Context";
+constexpr char kReference[] = "Reference";
+constexpr char kOutputRules[] = "OutputRules";
+constexpr char kStreamType[] = "StreamType";
 
 // The bounds of the MaxDurationS option's IntConstrain, repeated here so that
 // an out-of-range value can be reported by name instead of being rejected
@@ -256,20 +275,37 @@ bool writeAtomically(const std::string &path, const std::string &contents,
     return true;
 }
 
-/// Put the ten daemon options back to their defaults, leaving the addon options
+/// Put every daemon option back to its default, leaving the addon options
 /// alone. Used when the TOML file does not exist at all: the daemon then runs
 /// on its built-in defaults, and the config page must show the same.
-void resetDaemonOptions(SarvamDictationConfig &config) {
+///
+/// Both engine pages are reset, not just the selected one: neither engine's
+/// settings exist in a file that does not exist.
+void resetDaemonOptions(SarvamDictationConfig &config, SaarasSettings &saaras,
+                        DictateSettings &dictate) {
     config.apiKey.reset();
-    config.model.reset();
+    config.engine.reset();
     config.mode.reset();
     config.languageCode.reset();
-    config.keyterms.reset();
     config.audioDevice.reset();
     config.sampleRate.reset();
     config.backend.reset();
     config.socketPath.reset();
     config.maxDurationS.reset();
+
+    saaras.model.reset();
+    saaras.keyterms.reset();
+    saaras.streamingPushToTalk.reset();
+    saaras.streamingToggle.reset();
+
+    dictate.style.reset();
+    dictate.rules.reset();
+    dictate.vocabulary.reset();
+    dictate.context.reset();
+    dictate.reference.reset();
+    dictate.outputRules.reset();
+    dictate.model.reset();
+    dictate.streamType.reset();
 }
 
 /// TOML string -> RawConfig value of a std::string option.
@@ -352,9 +388,6 @@ bool applyLanguageCode(const TomlDocument &document, RawConfig &raw,
     return true;
 }
 
-/// TOML array of strings -> the indexed children of a std::vector<std::string>
-/// option. An empty array still creates the node, so that the option really
-/// becomes empty instead of being left untouched.
 /// TOML boolean -> the "True"/"False" text fcitx5's RawConfig uses.
 bool applyBool(const TomlDocument &document, const char *section,
                const char *key, const char *option, RawConfig &raw,
@@ -415,24 +448,60 @@ bool applyStreaming(const TomlDocument &document, RawConfig &raw,
     return true;
 }
 
-bool applyKeyterms(const TomlDocument &document, RawConfig &raw,
-                   std::string *error) {
-    const TomlValue *value = document.get("api", "keyterms");
+/// TOML `dictate.style` -> the enum's stored name.
+///
+/// The daemon spells "no preference" as the empty string, while the page spells
+/// it as the `unset` entry of the combo; the two spellings are translated here,
+/// exactly as `api.language_code` translates auto-detection below. Both
+/// spellings are accepted on read, so a hand-edited file cannot produce a value
+/// the daemon would forward to the service verbatim.
+bool applyDictateStyle(const TomlDocument &document, RawConfig &raw,
+                       std::string *error) {
+    const TomlValue *value = document.get("dictate", "style");
+    if (!value) {
+        return true;
+    }
+    if (value->type() != TomlType::String) {
+        setError(error, "dictate.style: expected a string value");
+        return false;
+    }
+    std::string text = value->asString();
+    if (text.empty()) {
+        text = "unset";
+    }
+    RawConfig probe;
+    probe.setValue(text);
+    DictateStyle parsed{};
+    if (!unmarshallOption(parsed, probe, false)) {
+        setError(error, "dictate.style: unknown value \"" + text + "\"");
+        return false;
+    }
+    raw.setValueByPath(kStyle, text);
+    return true;
+}
+
+/// TOML array of strings -> the indexed children of a std::vector<std::string>
+/// option. An empty array still creates the node, so that the option really
+/// becomes empty instead of being left untouched.
+bool applyArray(const TomlDocument &document, const char *section,
+                const char *key, const char *option, RawConfig &raw,
+                std::string *error) {
+    const TomlValue *value = document.get(section, key);
     if (!value) {
         return true;
     }
     if (value->type() != TomlType::Array) {
-        setError(error,
-                 "api.keyterms: expected an array of strings, for example "
-                 "[\"Sarvam\", \"dictation\"]");
+        setError(error, std::string(section) + "." + key +
+                            ": expected an array of strings, for example "
+                            "[\"Sarvam\", \"dictation\"]");
         return false;
     }
-    const std::vector<std::string> &terms = value->asArray();
-    raw.setValueByPath(kKeyterms, std::string());
-    for (size_t index = 0; index < terms.size(); ++index) {
+    const std::vector<std::string> &items = value->asArray();
+    raw.setValueByPath(option, std::string());
+    for (size_t index = 0; index < items.size(); ++index) {
         const std::string childPath =
-            std::string(kKeyterms) + "/" + std::to_string(index);
-        raw.setValueByPath(childPath, terms[index]);
+            std::string(option) + "/" + std::to_string(index);
+        raw.setValueByPath(childPath, items[index]);
     }
     return true;
 }
@@ -526,23 +595,31 @@ long long optionInteger(const RawConfig &raw, const char *option,
     return parsed;
 }
 
-/// The indexed children of the Keyterms option, in order. fcitx5 marshals a
-/// std::vector<std::string> as the children "0", "1" and so on, and stops at
+/// The value to write for `dictate.style`: the combo's `unset` entry becomes
+/// the empty string the daemon documents as "let the service choose".
+std::string dictateStyleForFile(const RawConfig &raw) {
+    const std::string text = optionText(raw, kStyle);
+    return text == "unset" ? std::string() : text;
+}
+
+/// The indexed children of a std::vector<std::string> option, in order. fcitx5
+/// marshals such an option as the children "0", "1" and so on, and stops at
 /// the first missing index, exactly as its own unmarshaller does.
-std::vector<std::string> keytermsFromRaw(const RawConfig &raw) {
-    std::vector<std::string> terms;
-    auto node = raw.get(kKeyterms);
+std::vector<std::string> arrayFromRaw(const RawConfig &raw,
+                                      const char *option) {
+    std::vector<std::string> items;
+    auto node = raw.get(option);
     if (!node) {
-        return terms;
+        return items;
     }
     for (size_t index = 0;; ++index) {
         auto child = node->get(std::to_string(index));
         if (!child) {
             break;
         }
-        terms.push_back(child->value());
+        items.push_back(child->value());
     }
-    return terms;
+    return items;
 }
 
 } // namespace
@@ -586,7 +663,8 @@ bool daemonConfigExists(const std::string &path) {
     return S_ISREG(info.st_mode) != 0;
 }
 
-bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
+bool loadDaemonConfig(SarvamDictationConfig &config, SaarasSettings &saaras,
+                      DictateSettings &dictate, const std::string &path,
                       std::string *error) {
     if (path.empty()) {
         setError(error, "the daemon config path is empty");
@@ -599,7 +677,7 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
             // No file at all: the daemon falls back to its built-in defaults.
             FCITX_SARVAMDICTATIONCONFIG_DEBUG()
                 << "no daemon config at " << path << ", using defaults";
-            resetDaemonOptions(config);
+            resetDaemonOptions(config, saaras, dictate);
             return true;
         }
         setError(error, "cannot access " + path + ": " + describeErrno(errno));
@@ -624,42 +702,74 @@ bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
             << path << ": ignoring: " << warning;
     }
 
-    // Build the RawConfig completely before touching `config`: if anything in
-    // the file is wrong, the caller keeps its current values.
+    // Build the RawConfigs completely before touching the three objects: if
+    // anything in the file is wrong, the caller keeps its current values.
+    //
+    // One RawConfig per Configuration, because the objects reuse option paths
+    // (`Model` is both the Saaras model enum and the Dictate model string) and
+    // a shared RawConfig would hand one object's value to the other's
+    // unmarshaller, which resets the option instead of loading it.
     RawConfig raw;
+    RawConfig saarasRaw;
+    RawConfig dictateRaw;
     if (!applyString(document, "api", "key", kApiKey, raw, error) ||
-        !applyEnum<DictationModel>(document, "api", "model", kModel, raw,
-                                   error) ||
+        !applyEnum<Engine>(document, "api", "engine", kEngine, raw, error) ||
         !applyEnum<DictationMode>(document, "api", "mode", kMode, raw, error) ||
-        !applyStreaming(document, raw, error) ||
         !applyLanguageCode(document, raw, error) ||
-        !applyKeyterms(document, raw, error) ||
         !applyString(document, "audio", "device", kAudioDevice, raw, error) ||
         !applySampleRate(document, raw, error) ||
         !applyEnum<DictationBackend>(document, "audio", "backend", kBackend,
                                      raw, error) ||
         !applyString(document, "server", "socket_path", kSocketPath, raw,
                      error) ||
-        !applyMaxDuration(document, raw, error)) {
+        !applyMaxDuration(document, raw, error) ||
+        // The Saaras page, still under [api].
+        !applyEnum<DictationModel>(document, "api", "model", kModel,
+                                   saarasRaw, error) ||
+        !applyStreaming(document, saarasRaw, error) ||
+        !applyArray(document, "api", "keyterms", kKeyterms, saarasRaw,
+                    error) ||
+        // The Dictate page: the [dictate] table. It is read whether or not
+        // `engine` selects it, so switching engines never loses the settings.
+        !applyDictateStyle(document, dictateRaw, error) ||
+        !applyString(document, "dictate", "rules", kRules, dictateRaw,
+                     error) ||
+        !applyArray(document, "dictate", "vocabulary", kVocabulary,
+                    dictateRaw, error) ||
+        !applyString(document, "dictate", "context", kContext, dictateRaw,
+                     error) ||
+        !applyString(document, "dictate", "reference", kReference,
+                     dictateRaw, error) ||
+        !applyString(document, "dictate", "output_rules", kOutputRules,
+                     dictateRaw, error) ||
+        !applyString(document, "dictate", "model", kModel, dictateRaw,
+                     error) ||
+        !applyEnum<DictateStreamType>(document, "dictate", "stream_type",
+                                      kStreamType, dictateRaw, error)) {
         return false;
     }
 
     // partial = true: options that are absent from `raw` - the addon settings,
-    // and any daemon key the file does not mention - keep their current value.
+    // the other engine's page, and any daemon key the file does not mention -
+    // keep their current value.
     config.load(raw, /*partial=*/true);
+    saaras.load(saarasRaw, /*partial=*/true);
+    dictate.load(dictateRaw, /*partial=*/true);
 
     // The daemon forces streaming on for both modes for saaras:v3-realtime,
     // because that model cannot run on REST at all, so the page shows the state
     // the daemon will actually be in instead of two stale toggles.
-    if (config.model.value() == DictationModel::SaarasV3Realtime) {
-        config.streamingPushToTalk.setValue(true);
-        config.streamingToggle.setValue(true);
+    if (saaras.model.value() == DictationModel::SaarasV3Realtime) {
+        saaras.streamingPushToTalk.setValue(true);
+        saaras.streamingToggle.setValue(true);
     }
     return true;
 }
 
 bool saveDaemonConfig(const SarvamDictationConfig &config,
-                      const std::string &path, std::string *error) {
+                      const SaarasSettings &saaras,
+                      const DictateSettings &dictate, const std::string &path,
+                      std::string *error) {
     if (path.empty()) {
         setError(error, "the daemon config path is empty");
         return false;
@@ -692,26 +802,37 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
     }
 
     // `language_code` is written in the daemon's spelling: empty means
-    // auto-detect, not the config page's `auto` entry. Writing `auto` here would
-    // be forwarded to the API as a language tag and rejected.
+    // auto-detect, not the config page's `auto` entry. Writing `auto` here
+    // would be forwarded to the API as a language tag and rejected.
+    // `dictate.style` gets the same treatment below: empty means "let the
+    // service choose".
 
     // save() gives the values in exactly the form the options marshall them, so
     // the enums arrive as their stored names and the integers as decimal text.
+    // One RawConfig per Configuration, as in loadDaemonConfig(): the three
+    // objects are three pages of this one file, not three files.
     RawConfig raw;
+    RawConfig saarasRaw;
+    RawConfig dictateRaw;
     config.save(raw);
+    saaras.save(saarasRaw);
+    dictate.save(dictateRaw);
 
     document.set("api", "key", TomlValue::string(optionText(raw, kApiKey)));
-    document.set("api", "model", TomlValue::string(optionText(raw, kModel)));
+    document.set("api", "engine",
+                 TomlValue::string(optionText(raw, kEngine)));
+    document.set("api", "model",
+                 TomlValue::string(optionText(saarasRaw, kModel)));
     document.set("api", "mode", TomlValue::string(optionText(raw, kMode)));
     // The daemon forces streaming on for both modes for saaras:v3-realtime
     // whatever the two toggles say, so the file must not claim otherwise: write
     // the state the daemon will actually be in.
     const bool realtimeOnly =
-        config.model.value() == DictationModel::SaarasV3Realtime;
+        saaras.model.value() == DictationModel::SaarasV3Realtime;
     const bool pushToTalkForFile =
-        optionBool(raw, kStreamingPushToTalk, false) || realtimeOnly;
+        optionBool(saarasRaw, kStreamingPushToTalk, false) || realtimeOnly;
     const bool toggleForFile =
-        optionBool(raw, kStreamingToggle, false) || realtimeOnly;
+        optionBool(saarasRaw, kStreamingToggle, false) || realtimeOnly;
     document.set("api", "streaming_push_to_talk",
                  TomlValue::boolean(pushToTalkForFile));
     document.set("api", "streaming_toggle",
@@ -726,7 +847,8 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
                  TomlValue::boolean(pushToTalkForFile && toggleForFile));
     document.set("api", "language_code",
                  TomlValue::string(languageCodeForFile(raw)));
-    document.set("api", "keyterms", TomlValue::array(keytermsFromRaw(raw)));
+    document.set("api", "keyterms",
+                 TomlValue::array(arrayFromRaw(saarasRaw, kKeyterms)));
     document.set("audio", "device",
                  TomlValue::string(optionText(raw, kAudioDevice)));
     document.set("audio", "sample_rate",
@@ -737,6 +859,26 @@ bool saveDaemonConfig(const SarvamDictationConfig &config,
                  TomlValue::string(optionText(raw, kSocketPath)));
     document.set("server", "max_duration_s",
                  TomlValue::integer(optionInteger(raw, kMaxDurationS, 300)));
+
+    // The [dictate] table, written whatever `engine` says: the daemon ignores
+    // it unless the engine is `dictate`, and writing it always is what keeps a
+    // hand-written table alive across an Apply with the other engine selected.
+    document.set("dictate", "style",
+                 TomlValue::string(dictateStyleForFile(dictateRaw)));
+    document.set("dictate", "rules",
+                 TomlValue::string(optionText(dictateRaw, kRules)));
+    document.set("dictate", "vocabulary",
+                 TomlValue::array(arrayFromRaw(dictateRaw, kVocabulary)));
+    document.set("dictate", "context",
+                 TomlValue::string(optionText(dictateRaw, kContext)));
+    document.set("dictate", "reference",
+                 TomlValue::string(optionText(dictateRaw, kReference)));
+    document.set("dictate", "output_rules",
+                 TomlValue::string(optionText(dictateRaw, kOutputRules)));
+    document.set("dictate", "model",
+                 TomlValue::string(optionText(dictateRaw, kModel)));
+    document.set("dictate", "stream_type",
+                 TomlValue::string(optionText(dictateRaw, kStreamType)));
 
     const std::string serialized = document.serialize();
     if (!writeAtomically(path, serialized, error)) {

@@ -4,14 +4,29 @@
  *
  * The configuration surface of the Sarvam dictation addon.
  *
- * One FCITX_CONFIGURATION holds two groups of settings that live in two
- * different files:
+ * Three FCITX_CONFIGURATION objects, because the config page is three pages.
+ * fcitx5 has no per-option visibility API at all -- fcitx-config/option.h
+ * carries no "visible"/"enabled" concept, and the frontends build one static
+ * widget set per page (fcitx5-configtool configwidget.cpp:191-225) -- so the
+ * only live, supported way to give each engine its own settings is a
+ * sub-configuration per engine, reached through the enum's SubConfigPath
+ * property. See EngineAnnotation below.
  *
- *  - The daemon settings (api.*, audio.*, server.*) are owned by the Python
- *    daemon and stored in ~/.config/sarvam-dictation/config.toml. The addon
- *    keeps no copy: loadDaemonConfig() fills these options from that file and
- *    saveDaemonConfig() writes them back to it, so the TOML file stays the one
- *    source of truth and the API key is never duplicated.
+ *  - SarvamDictationConfig is the main page: the options both engines share,
+ *    plus the addon's own settings.
+ *  - SaarasSettings and DictateSettings are the two engine pages, returned by
+ *    SarvamDictation::getSubConfig("saaras") / ("dictate").
+ *
+ * The three objects all marshal into the same file, and which object an option
+ * lives in is a UI fact, not a file-layout fact:
+ *
+ *  - The daemon settings (api.*, audio.*, server.*, dictate.*) are owned by the
+ *    Python daemon and stored in ~/.config/sarvam-dictation/config.toml. The
+ *    addon keeps no copy: loadDaemonConfig() fills these options from that file
+ *    and saveDaemonConfig() writes them back to it, so the TOML file stays the
+ *    one source of truth and the API key is never duplicated. The Saaras
+ *    options stay under [api] and the Dictate ones under [dictate]; the daemon
+ *    reads one file and does not know how many pages the dialog has.
  *
  *  - The addon settings (TriggerKey and friends) are of no interest to the
  *    daemon and keep living in the fcitx5 conf file
@@ -87,6 +102,71 @@ namespace fcitx::sarvam {
                           FCITX_ARRAY_SIZE(_##TYPE##_Names),                   \
                       "Enum label count mismatch");                            \
     }
+
+/*
+ * Which backend the daemon talks to. The stored names are the values of
+ * `[api] engine` in config.toml.
+ *
+ * The two engines differ in what the rest of the settings mean: `saaras` is the
+ * plain speech-to-text API (model, keyterms, streaming), `dictate` takes a
+ * transcript plus instructions (style, rules, vocabulary, context, ...). Those
+ * two groups are separate Configuration objects -- see SaarasSettings and
+ * DictateSettings below -- and this enum is what puts the matching one behind
+ * the Configure button.
+ */
+enum class Engine { Saaras, Dictate };
+FCITX_CONFIG_ENUM_NAME(Engine, "saaras", "dictate");
+SARVAM_DICTATION_ENUM_LABELS(Engine, N_("Saaras (speech-to-text)"),
+                             N_("Dictate (speech-to-text with instructions)"));
+
+/*
+ * The two engine sub-pages, and the names the addon answers to.
+ *
+ * The URI is what the description carries and what the frontend asks for:
+ * fcitx5's D-Bus module splits `fcitx://config/addon/<addon>[/<subPath>]` and
+ * calls AddonInstance::getSubConfig(<subPath>) with everything after the addon
+ * name (dbusmodule.cpp:351-378), so the last segment below is also the string
+ * SarvamDictation::getSubConfig() compares against.
+ */
+constexpr char kSaarasSubConfigName[] = "saaras";
+constexpr char kDictateSubConfigName[] = "dictate";
+constexpr char kSaarasSubConfigUri[] =
+    "fcitx://config/addon/sarvamdictation/saaras";
+constexpr char kDictateSubConfigUri[] =
+    "fcitx://config/addon/sarvamdictation/dictate";
+
+/*
+ * The "Configure" button next to the engine combo.
+ *
+ * fcitx5-configtool honours exactly one value-reactive property on a generated
+ * page: the per-enum-value `SubConfigPath/<i>`. The Qt Widgets frontend reads
+ * it into the combo's subConfigPathRole and shows the button only while the
+ * current entry has a path (configwidgetslib/optionwidget.cpp:344-363); the KCM
+ * binds the button's `visible` to the combo's current index
+ * (kcm/ui/EnumOption.qml:81-89). One path per engine value therefore gives
+ * "Saaras settings or Dictate settings, following the combo", live, using only
+ * 5.1.x API. The in-tree precedent is the Classic UI theme selector
+ * (src/ui/classic/classicui.h:83-112, ThemeAnnotation).
+ *
+ * `LaunchSubConfig=True` is what makes the frontend open the URI as a nested
+ * generated page rather than launching an external program: it is the one flag
+ * that distinguishes SubConfigOption from ExternalOption
+ * (fcitx-config/option.cpp:81-84).
+ *
+ * The `Enum/<i>` names and the `EnumI18n/<i>` labels the combo also needs are
+ * written by FCITX_CONFIG_ENUM_NAME's dumpDescriptionHelper and by the label
+ * macro, so they are not repeated here; only the paths are ours.
+ */
+struct EngineAnnotation : public EngineI18NAnnotation {
+    void dumpDescription(RawConfig &config) const {
+        EngineI18NAnnotation::dumpDescription(config);
+        config.setValueByPath("LaunchSubConfig", "True");
+        // Indexed by the enum's own order, exactly like Enum/<i>:
+        // Enum/0 = "saaras" -> SubConfigPath/0, Enum/1 = "dictate" -> 1.
+        config.setValueByPath("SubConfigPath/0", kSaarasSubConfigUri);
+        config.setValueByPath("SubConfigPath/1", kDictateSubConfigUri);
+    }
+};
 
 /*
  * Dictation model. The stored name is the value the Sarvam API expects, so the
@@ -188,12 +268,23 @@ struct AudioDeviceConstrain {
     void dumpDescription(RawConfig &config) const;
 };
 
+/*
+ * The Saaras page: the options that only mean anything to the speech-to-text
+ * engine. They stay under [api] in config.toml.
+ *
+ * A separate Configuration object rather than a nested Configuration option: a
+ * nested one renders *inside* the main page as a group box
+ * (fcitx5-configtool configwidget.cpp:213-221, and the KCM flattens it into a
+ * section at kcm/main.cpp:158-185), which is exactly what the engine split has
+ * to avoid.
+ */
 FCITX_CONFIGURATION(
-    SarvamDictationConfig,
-    // ---- Daemon settings, stored in ~/.config/sarvam-dictation/config.toml --
-    Option<std::string> apiKey{this, "ApiKey", _("Sarvam API key"), ""};
+    SaarasSettings,
     OptionWithAnnotation<DictationModel, DictationModelI18NAnnotation> model{
         this, "Model", _("Model"), DictationModel::SaarasV4};
+    Option<std::vector<std::string>> keyterms{
+        this, "Keyterms", _("Keyterms (saaras:v4 only, max 50)"),
+        std::vector<std::string>()};
     // Off by default: the REST path stays the default, and the two dictation
     // modes are configured independently, because the protocol already tells
     // them apart -- push-to-talk sends start/stop, record-and-send sends
@@ -205,15 +296,26 @@ FCITX_CONFIGURATION(
         _("Stream audio while the push-to-talk key is held"), false};
     Option<bool> streamingToggle{
         this, "StreamingToggle",
-        _("Stream audio in record-and-send mode"), false};
+        _("Stream audio in record-and-send mode"), false};);
+
+FCITX_CONFIGURATION(
+    SarvamDictationConfig,
+    // ---- Daemon settings, stored in ~/.config/sarvam-dictation/config.toml --
+    Option<std::string> apiKey{this, "ApiKey", _("Sarvam API key"), ""};
+    // Declared high on the page because it decides which sub-page holds the
+    // rest of the settings, and before the shared rows so the combo is the
+    // first thing the user reads. The annotation is what puts the Configure
+    // button next to it.
+    OptionWithAnnotation<Engine, EngineAnnotation> engine{
+        this, "Engine", _("Engine"), Engine::Saaras};
+    // Shared by both engines. `translate` is a Saaras mode: the daemon rejects
+    // it on the Dictate socket (translation there is a `rules` request), and
+    // the validation stays in the daemon rather than being duplicated here.
     OptionWithAnnotation<DictationMode, DictationModeI18NAnnotation> mode{
         this, "Mode", _("Output mode"), DictationMode::Transcribe};
     OptionWithAnnotation<DictationLanguage, DictationLanguageI18NAnnotation>
         languageCode{this, "LanguageCode", _("Language"),
                      DictationLanguage::Auto};
-    Option<std::vector<std::string>> keyterms{
-        this, "Keyterms", _("Keyterms (saaras:v4 only, max 50)"),
-        std::vector<std::string>()};
     // The value is still a plain std::string: only its presentation changes, so
     // sarvamdictationconfig.cpp keeps reading and writing audio.device as text.
     Option<std::string, AudioDeviceConstrain> audioDevice{
@@ -288,6 +390,67 @@ FCITX_CONFIGURATION(
         this, "AppendSpace",
         _("Append a trailing space after the transcript"), true};);
 
+/*
+ * Dictate transcript style. `Unset` is the stored name of the "no preference"
+ * entry and is written to the file as the empty string, which is what the
+ * daemon documents for "let the service choose". The two spellings are
+ * translated in sarvamdictationconfig.cpp, the same way `api.language_code`
+ * spells auto-detection as an empty string there: an enum entry whose stored
+ * name is empty would put an unnamed row in the combo, so the combo keeps a
+ * name and only the file uses the empty one.
+ */
+enum class DictateStyle { Unset, None, Light, Clean };
+FCITX_CONFIG_ENUM_NAME(DictateStyle, "unset", "none", "light", "clean");
+SARVAM_DICTATION_ENUM_LABELS(
+    DictateStyle, N_("No preference (let the service choose)"),
+    N_("None (keep the transcript as spoken)"),
+    N_("Light (remove fillers and false starts)"),
+    N_("Clean (readable, punctuation, casing)"));
+
+/// How the Dictate socket is used.
+enum class DictateStreamType { Fast, Balanced, Simulated };
+FCITX_CONFIG_ENUM_NAME(DictateStreamType, "fast", "balanced", "simulated");
+SARVAM_DICTATION_ENUM_LABELS(DictateStreamType, N_("Fast (lowest latency)"),
+                             N_("Balanced (recommended)"),
+                             N_("Simulated (one result at the end)"));
+
+/*
+ * The Dictate page: the options that only mean anything to that engine. They go
+ * to the [dictate] table of config.toml and are ignored by the daemon unless
+ * `[api] engine = "dictate"`.
+ *
+ * The length limits in the labels are the daemon's; the page repeats them
+ * because a QLineEdit cannot be told about them, and the daemon is still the
+ * one that enforces them (it reports a rejected combination as `config_invalid`
+ * at runtime).
+ */
+FCITX_CONFIGURATION(
+    DictateSettings,
+    OptionWithAnnotation<DictateStyle, DictateStyleI18NAnnotation> style{
+        this, "Style", _("Transcript style"), DictateStyle::Unset};
+    Option<std::string> rules{
+        this, "Rules", _("Rules (free text, at most 2000 characters)"), ""};
+    Option<std::vector<std::string>> vocabulary{
+        this, "Vocabulary",
+        _("Vocabulary (names and terms, at most 1000 entries of 64 "
+          "characters)"),
+        std::vector<std::string>()};
+    Option<std::string> context{
+        this, "Context", _("Context (one line, at most 2000 characters)"), ""};
+    Option<std::string> reference{
+        this, "Reference",
+        _("Reference document of names and terms (at most 50000 characters)"),
+        ""};
+    Option<std::string> outputRules{
+        this, "OutputRules", _("Output rules (at most 4000 characters)"), ""};
+    // Free text rather than an enum: a snapshot name is not a list this addon
+    // can know, and an empty value means "whatever the service defaults to".
+    Option<std::string> model{
+        this, "Model", _("Model snapshot (empty = the service default)"), ""};
+    OptionWithAnnotation<DictateStreamType, DictateStreamTypeI18NAnnotation>
+        streamType{this, "StreamType", _("Stream type"),
+                   DictateStreamType::Balanced};);
+
 /// Absolute path of the daemon config file: $XDG_CONFIG_HOME/sarvam-dictation/
 /// config.toml when XDG_CONFIG_HOME is set and non-empty, else
 /// ~/.config/sarvam-dictation/config.toml.
@@ -296,27 +459,44 @@ std::string daemonConfigPath();
 /// True when the path exists and is a regular file.
 bool daemonConfigExists(const std::string &path);
 
-/// Fill the daemon-owned options of `config` from the TOML file at `path`.
+/// Fill the daemon-owned options of `config`, `saaras` and `dictate` from the
+/// TOML file at `path`.
+///
+/// The three objects are three pages of one file: `config` takes the shared
+/// keys plus `[api] engine`, `saaras` takes the rest of `[api]` and `dictate`
+/// takes `[dictate]`. Each is loaded on its own RawConfig, so the two `Model`
+/// options (the Saaras model enum and the Dictate model string) cannot read
+/// each other's value.
 ///
 /// A missing file is not an error: the daemon falls back to its built-in
 /// defaults, so the daemon options are reset to their defaults and the call
 /// returns true. An unreadable file, a path that is not a regular file, or a
 /// value of the wrong type (or outside the option's range) returns false,
-/// leaves `config` completely untouched, and describes the reason in `error`
-/// when it is non-null. Parse warnings are logged at debug level and never fail
-/// the load. Keys that the file does not mention keep their current value, so a
-/// fresh config keeps the defaults.
-bool loadDaemonConfig(SarvamDictationConfig &config, const std::string &path,
+/// leaves all three objects completely untouched, and describes the reason in
+/// `error` when it is non-null. Parse warnings are logged at debug level and
+/// never fail the load. Keys that the file does not mention keep their current
+/// value (the load is partial, exactly like the addon's setConfig), so a fresh
+/// config keeps the defaults.
+bool loadDaemonConfig(SarvamDictationConfig &config, SaarasSettings &saaras,
+                      DictateSettings &dictate, const std::string &path,
                       std::string *error = nullptr);
 
-/// Write the daemon-owned options of `config` to `path`.
+/// Write the daemon-owned options of `config`, `saaras` and `dictate` to
+/// `path`.
+///
+/// Every key of the frozen table is written, from whichever of the three
+/// objects owns it, and both engine groups are always written: `[dictate]` is
+/// present even while the Saaras engine is selected, so switching engines does
+/// not lose the other engine's settings and load -> save -> load is stable.
 ///
 /// Every other key already in the file is preserved. Parent directories are
 /// created. The write is atomic - a temporary file in the same directory, an
 /// fsync, then a rename - and the result has mode 0600, because the file holds
 /// an API key. Returns false and describes the reason in `error` on failure.
 bool saveDaemonConfig(const SarvamDictationConfig &config,
-                      const std::string &path, std::string *error = nullptr);
+                      const SaarasSettings &saaras,
+                      const DictateSettings &dictate, const std::string &path,
+                      std::string *error = nullptr);
 
 // Declared here rather than at global scope so the name cannot collide with
 // the addon's own log category; the definition is in sarvamdictationconfig.cpp.

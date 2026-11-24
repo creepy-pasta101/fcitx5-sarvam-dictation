@@ -24,7 +24,7 @@ The wire protocol between the two is a frozen contract and is documented in [doc
 
 You need Fcitx 5 installed and running, a C++17 compiler with CMake 3.19 or newer, and the fcitx5 development headers so the addon can be built. On Debian and Ubuntu the headers come from `libfcitx5core-dev`, `libfcitx5config-dev`, `libfcitx5utils-dev` and `fcitx5-modules-dev`; on Fedora it is `fcitx5-devel`; on Arch the headers ship with the `fcitx5` package. Distribution package names vary between releases, so if one of these does not exist on your system, search your package manager for `fcitx5` development files — the build only needs `Fcitx5Core` and the `Notifications` module of `Fcitx5Module`.
 
-The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai). Dictation over the REST endpoint works with any valid key; the optional streaming mode additionally needs a subscription that includes realtime access.
+The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai). Dictation over the REST endpoint works with any valid key; the optional streaming mode additionally needs a subscription that includes realtime access. The Dictate engine needs `sarvamai` 0.1.49 or newer — the first release that ships the Dictate clients. An older SDK answers with a clear error rather than a wrong transcript — see [Dictate settings](#dictate-settings).
 
 Whichever of the three the daemon resolves, it runs it so that what comes back is bare audio rather than a container: `parec --raw`, `arecord -t raw` and `pw-record --raw`. The PipeWire flag is the one worth knowing about, because it is the one that is easy to leave out and its absence is not obvious from the command. `pw-record` is `pw-cat`, and `pw-cat` picks what to write from the name it is given; the streaming path gives it `-`, and with no container named, `-` means the Sun/NeXT AU container. Without `--raw` the command therefore writes a libsndfile AU file to standard output — a header followed by samples in that container's byte order — where the streaming path expects raw little-endian 16-bit samples. `--raw` is what turns the same invocation into a bare PCM stream.
 
@@ -117,6 +117,17 @@ The page writes two files, because the two processes own different things:
 
 When you press *Apply*, the addon writes `config.toml` from the values on the page, then sends a `reload` command to the daemon over the socket. A running daemon re-reads the file and applies the new settings to the next recording — no restart of either process is needed.
 
+### Choosing an engine
+
+The *Engine* row picks which Sarvam API the daemon talks to, and the button beside it opens that engine's own page:
+
+* **Saaras** — speech-to-text: the model, the keyterms and the two streaming switches.
+* **Dictate** — finished text: the style, your formatting rules, the vocabulary, the context, a reference document, output rules, a pinned model and the stream type.
+
+Shared settings — the API key, the output mode, the language, the audio device, the sample rate, the capture backend, the socket path and the maximum length — stay on this page, because both engines use them. The button follows the combo: pick the other engine and it opens the other page. Both pages write into the same `config.toml`, so switching back and forth never loses the settings you left behind.
+
+This is why the page is built the way it is. fcitx5 has no way to hide a row conditionally — an option is either on the page or it is not, decided when the dialog opens — so the engine's own settings live on a sub-page instead of appearing and disappearing beside the shared ones.
+
 ### Daemon settings
 
 These are the settings the daemon reads from `~/.config/sarvam-dictation/config.toml`. Each one appears on the configuration page with the label in the first column.
@@ -130,11 +141,37 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 | Output mode | `[api] mode` | `transcribe` | What Saaras returns: `transcribe`, `translate`, `verbatim`, `translit` or `codemix`. |
 | Language | `[api] language_code` | empty | Spoken language. Empty means auto-detect, which is what the config page's *Auto-detect* entry writes; otherwise a code such as `hi-IN`, `bn-IN` or `ta-IN`. A hand-written `auto` is accepted too and treated as empty. |
 | Keyterms | `[api] keyterms` | `[]` | List of words and phrases to bias the model towards. `saaras:v4` only, at most 50 entries. |
+| Engine | `[api] engine` | `saaras` | Which Sarvam API the daemon talks to: `saaras` for speech-to-text, or `dictate` for the Dictate API, which returns finished text instead of a raw transcript. See [Dictate settings](#dictate-settings). |
 | Audio device | `[audio] device` | empty | Capture source, picked from a dropdown of the devices the daemon found. Empty means the system default source. |
 | Sample rate | `[audio] sample_rate` | `16000` | Recording sample rate: `16000` Hz (recommended) or `8000` Hz (telephony). |
 | Capture backend | `[audio] backend` | `auto` | Which capture program to use: `auto`, `pipewire` (`pw-record`), `pulse` (`parec`) or `alsa` (`arecord`). |
 | Socket path | `[server] socket_path` | empty | Path to the daemon socket. Empty means the default rule (`$XDG_RUNTIME_DIR/sarvam-dictation.sock`, else `/tmp/sarvam-dictation-<uid>.sock`). |
 | Max recording length (seconds) | `[server] max_duration_s` | `300` | Auto-stop and transcribe at this length. Accepts 5 to 3600. |
+
+### Dictate settings
+
+`[api] engine = "dictate"` switches the daemon from Saaras to Sarvam's Dictate API. Dictate returns the text a person meant to type rather than a transcript: punctuation, no fillers or false starts, digits instead of spoken numbers, and your names spelled your way. These are the settings behind the *Configure* button when *Engine* is *Dictate*; in the file they live in their own `[dictate]` table, because they only mean anything to that engine — with `engine = "saaras"` they are read, validated and left alone.
+
+Dictate talks to Sarvam through the same `sarvamai` SDK as everything else, so there is nothing extra to install — but the SDK must be 0.1.49 or newer, the first release with the Dictate clients. Upgrade it for the interpreter the daemon runs under:
+
+```bash
+pip install -U 'sarvamai>=0.1.49'
+```
+
+With an older SDK the daemon still starts and still dictates on the Saaras engine; a Dictate dictation fails with a notification telling you to upgrade.
+
+| Setting | `config.toml` key | Default | Meaning |
+|---|---|---|---|
+| Style | `[dictate] style` | empty | How much the finishing step rewrites: `none` (no rewriting — the text is the raw transcript, and rules and vocabulary are not applied), `light` (keeps every word, adds punctuation, casing, digits and your spellings), or `clean` (as `light`, and also drops fillers, repeats, false starts and the first version of a self-correction). Empty means the service picks: `light` in `verbatim` mode, `clean` otherwise. |
+| Rules | `[dictate] rules` | empty | Formatting rules in plain language, up to 2,000 characters, applied on top of the style: layout, casing, number format, script, or a translation request. Rules change how the text is written; they must not ask for new content. |
+| Vocabulary | `[dictate] vocabulary` | `[]` | Names and terms the model should spell your way — products, people, medicines. Up to 1,000 entries of up to 64 characters. This replaces Saaras's `keyterms`; the Dictate socket refuses `keyterms`. |
+| Context | `[dictate] context` | empty | One line describing the situation, up to 2,000 characters, for example *a note about the Sarvam billing API*. |
+| Reference | `[dictate] reference` | empty | A document with the names and terms for this recording, up to 50,000 characters of plain text. Anything named in it is spelled as the document spells it. |
+| Output rules | `[dictate] output_rules` | empty | Up to 4,000 characters describing a JSON record, a summary or an answer to build from the whole recording. The daemon reads the result so the session ends cleanly, and **does not type it**: dictation types what you said. Useful mainly when something else reads the daemon's log. |
+| Model | `[dictate] model` | empty | Pins a dated Dictate snapshot, for example `dictate-v1-2026-11-04`, so the text your workflow expects does not change under you. Empty uses the service default. |
+| Stream type | `[dictate] stream_type` | `balanced` | Latency of the live preview: `fast` (quickest partial text, at most half a second of audio per message), `balanced` (more accurate), or `simulated` (no partials at all, only the finished text per turn). |
+
+Two rules follow from the API itself. `[api] mode = "translate"` is refused with `engine = "dictate"`, because Dictate has no translate mode — ask for a translation in `[dictate] rules` instead. And `[audio] sample_rate` must stay `16000` or `8000`, which are the only two rates the Dictate socket accepts; the daemon refuses any other combination at load time rather than letting the socket reject it at connect.
 
 ### Choosing an audio device
 
@@ -157,6 +194,8 @@ The three endpoints the SDK can reach do not share a model list. Each one has it
 | `client.speech_to_text` | REST `POST /speech-to-text` | `saarika:v2.5`, `saaras:v3`, `saaras:v4` |
 | `client.speech_to_text_streaming` | WebSocket `/speech-to-text/ws` (legacy) | `saaras:v3`, `saaras:v4` |
 | `client.speech_to_text_realtime_streaming` | WebSocket `/speech-to-text-realtime/ws` | `saaras:v3-realtime`, `saaras:v4` |
+
+Dictate is a fourth namespace of its own, reached at `/v2/dictate` rather than through the SDK: its model names look like `dictate-v1` or `dictate-v1-2026-11-04`, and none of the Saaras names above work there. That is why `[dictate] model` is a separate key rather than a value of `[api] model`.
 
 The SDK exposes these as three separate clients, with three separate model lists, and the lists are not interchangeable. `saaras:v3-realtime` exists only on the realtime endpoint and is not a REST model at all, so a request that carries it to `POST /speech-to-text` is refused by the provider with a 400. `saaras:v4` is the one model that works everywhere: it is the only name all three endpoints accept, which is why it is the default. The daemon uses two of the three clients — the REST client for the ordinary path, the realtime client when streaming is on — and checks the configured model against the list of the endpoint it is about to use before any request is made.
 
@@ -193,6 +232,7 @@ The file the page writes looks like this. A missing file is not an error — eve
 
 [api]
 key = "YOUR_SARVAM_API_KEY"
+engine = "saaras"           # "saaras" (speech-to-text) or "dictate" (finished text)
 model = "saaras:v4"
 mode = "transcribe"
 language_code = ""          # empty = auto-detect
@@ -200,6 +240,16 @@ keyterms = []
 streaming_push_to_talk = false
 streaming_toggle = false
 streaming = false            # legacy: applies to both modes when a per-mode key is absent
+
+[dictate]                     # read only when [api] engine = "dictate"
+style = ""                    # "none", "light", "clean"; empty = the service's choice
+rules = ""                    # formatting rules in plain language, up to 2000 characters
+vocabulary = []               # names and terms to spell your way
+context = ""                  # one line about the situation, up to 2000 characters
+reference = ""                # a document with names and terms, up to 50000 characters
+output_rules = ""             # JSON/summary instructions; read, never typed
+model = ""                    # pin a snapshot, e.g. "dictate-v1-2026-11-04"
+stream_type = "balanced"      # "fast", "balanced", "simulated"
 
 [audio]
 device = ""

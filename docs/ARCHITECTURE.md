@@ -123,6 +123,30 @@ The obvious alternative was to let the page push values to the daemon over the s
 * **No second copy of the API key.** A socket-pushed configuration would either carry the key over the wire into the daemon's memory and a second persistence path, or need a separate mechanism for the one value that matters most. Keeping the key in the 0600 `config.toml` and nowhere else means there is exactly one file to protect and one file to audit.
 * **The daemon keeps working standalone.** The daemon has no dependency on fcitx5, on the addon, or on the socket being up in order to be configured. A user who installed only `pip install ./daemon` and runs it as a service edits `config.toml` and sends `reload`; the same loader serves both worlds, unchanged.
 
+### Why the engine has its own page
+
+fcitx5 offers no way to hide an option conditionally. `OptionBase` has no
+`setVisible`; the built-in `ConditionalHidden` takes a compile-time bool; and the
+page is only built when the dialog opens, so a row cannot appear or disappear as
+a combo changes. An option is on the page or it is not.
+
+What the generated page *does* support is a per-enum-value `SubConfigPath`: an
+enum whose annotation dumps `SubConfigPath/<i>` grows a *Configure* button that
+is shown for the selected value and follows the combo live. So the engine is an
+enum on the main page, and each engine's own settings live on their own generated
+page behind that button — `getSubConfig("saaras")` and `getSubConfig("dictate")`
+returning two separate `Configuration` objects. The page therefore shows exactly
+one engine's settings, without a Qt plugin, a second process, or a second config
+file.
+
+Two consequences are worth knowing. The sub-configurations are a UI fact, not a
+file-layout fact: `saveDaemonConfig` marshals all three objects into the one
+`config.toml`, and each page is marshalled through its own `RawConfig`, because
+both pages have an option at path `Model` and a shared one would feed the Saaras
+enum value into the Dictate string option. And `setConfig` must load partially —
+a page that is not open sends none of its keys, and a full load resets absent
+options to their defaults, which would silently wipe the other engine's settings.
+
 ### The flow
 
 1. `fcitx5-configtool` edits the addon's `Configuration` object. Both groups of options are in it: the daemon options are ordinary fcitx5 options that happen to be persisted elsewhere.
@@ -247,6 +271,78 @@ An empty result is legal, and it is the deadline that establishes it. "No finals
 The drain that feeds audio is given a much larger bound than a client-socket write, because the two timeouts cost different things. `_finish_drain` awaits the drain task, and a timeout there cancels it — but that task is what feeds captured audio into the socket, so cancelling it destroys speech the user has already spoken. A client-socket write that misses `DRAIN_TIMEOUT` is a different matter: what is lost there is the delivery of a message, not the audio, and the recording is intact. So the streaming drain is bounded by `STREAM_DRAIN_TIMEOUT`, well beyond the settle deadline, and when that expires the daemon logs a warning naming the risk rather than failing the recording, since the audio that did arrive is still worth transcribing and failing would throw that away as well.
 
 
+## The Dictate engine
+
+Saaras writes down what the recogniser heard. Dictate writes what the person
+meant to type: punctuation, no fillers or false starts, digits, the names from
+your own vocabulary, and optionally your formatting rules. Those are different
+products with different request shapes, so the daemon treats them as two
+*engines* rather than as two more models on one endpoint. `[api] engine` picks
+one, and everything downstream — the REST client, the socket client, the model
+namespace — follows from it.
+
+The switch is read per job, from the same snapshot every other setting uses. A
+`reload` therefore takes effect on the next recording and never in the middle of
+one, and the two engines never share a half-built client.
+
+### Through the SDK, like every other route
+
+Dictate goes through `sarvamai`, the same SDK the two Saaras routes use. The
+first version of this engine spoke the wire protocol by hand, because Dictate
+arrived in `sarvamai` 0.1.49 while the daemon's floor was 0.1.33 — a hand-written
+client kept the requirement low. That trade was then settled the other way: one
+SDK everywhere is worth the floor bump, because the request and event models are
+maintained upstream, a change to the service arrives as an SDK release rather
+than as a silent break in a hand-rolled frame, and there is exactly one way in
+this repository to talk to Sarvam.
+
+The floor is now `sarvamai>=0.1.49`. The import stays lazy — inside the method
+that builds the client, never at module scope — so the daemon starts, and the
+test-suite runs, on a machine without the SDK; a Dictate dictation on such a
+machine fails with a notification naming the upgrade rather than with a stack
+trace.
+
+### Manual endpointing, not VAD
+
+The addon is push-to-talk or record-and-send: one key press is one utterance.
+The Dictate socket can run its own voice-activity detection and cut turns on
+pauses, but that would bill the silence around a held key and split a sentence
+into several turns whenever the speaker breathes. The daemon therefore connects
+with `endpointing=manual`, sends `speech_start` when the session opens and
+`speech_end` when the key is released. One press, one turn, and only the audio
+between the two is billed.
+
+The `speech_start`/`speech_end` pair is legal *only* under manual endpointing —
+sent under `vad` the service answers `invalid_control` — which is why the
+endpointing mode and the message vocabulary are chosen together and never
+separately.
+
+### Turns are reassembled by index, not by arrival
+
+The socket labels every turn with `utterance_idx`, and the contract is explicit
+that a later turn's `transcript.final` can arrive before an earlier turn's
+`dictation.final`. Appending finals in arrival order would therefore put words
+in the wrong order in the user's text field. The client keeps finals in a
+dictionary keyed by `utterance_idx` and joins them in index order at the end.
+
+A turn that failed still produces exactly one `dictation.final`, with an empty
+text and a `degraded` reason. That is not an error to report: it is a turn that
+contributed nothing, and the rest of the dictation is still worth typing.
+
+### `text`, never `transcript`
+
+Every route returns two strings. `transcript` is what recognition heard;
+`text` is the finished version. The daemon types `text` and never falls back to
+`transcript` on its own: when the finishing step fails, the service sets
+`degraded` and puts the raw transcript *in* `text`, so the fallback has already
+happened inside the response. Reaching for `transcript` would quietly undo it.
+
+`output_rules` is a different feature with a different audience. When it is set,
+the socket sends one more event, `output.final`, holding a summary or a JSON
+record made from the whole recording. A dictation plugin must type what was
+said, so `output.final` is read — the read loop has to continue past it to reach
+`session.end` — and then discarded.
+
 ## Threading model
 
 The daemon is one asyncio loop, one task per client connection, and one worker thread at a time. Everything that touches the socket is a coroutine on the loop, so message handling is naturally serialised and the state machine needs no locks. Everything that blocks — spawning the recorder, waiting for it to exit, normalising the WAV, splitting it, calling the REST API — runs inside `asyncio.to_thread`. A streaming recording is the exception, and the exception is the point: its two jobs are a pipe read and a socket read, both of which are I/O the loop can wait on directly, so it adds two tasks to the loop rather than a worker thread. That is what keeps the loop responsive while a transcription is in flight: `ping` is answered and `cancel` is accepted throughout, which is what the protocol promises.
@@ -293,6 +389,8 @@ Transcription requires network access to Sarvam's API and a valid key. Nothing a
 The clipboard fallback is decided on focus alone. An application that holds a focused input context but discards committed text cannot be told apart from one that accepts it, because fcitx5 gives an addon no "a text widget is focused" bit and the capability flags are too rarely advertised on X11 to stand in for one. Nothing in the addon can detect that case; the *Always copy the transcript to the clipboard as well* option is the workaround, and it has to be turned on by the user.
 
 `config.toml` is the store for the daemon's settings and the addon's configuration page is the editor for them. The page does not merge a hand edit made while fcitx5 is running: pressing *Apply* writes the keys it manages from the values currently on the page. A hand edit made outside `fcitx5-configtool` is therefore best followed by `sarvam-dictation-ctl reload` rather than by *Apply*.
+
+The Dictate engine has no page in `fcitx5-configtool`. `[api] engine` and the whole `[dictate]` table are read from `config.toml` and survive an *Apply*, because the page writes only the keys it manages into the document it parsed, but nothing in the page sets them: switching engines is a hand edit followed by `sarvam-dictation-ctl reload`. A page for them would have to carry a style preset, a free-text rules box, a vocabulary list editor, two long text areas and a stream-type dropdown, which is a different kind of form from the single-column page the addon has now.
 
 ## Fcitx 5 version compatibility
 

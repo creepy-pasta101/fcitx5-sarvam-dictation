@@ -23,7 +23,10 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
     "Topic :: Text Processing :: Linguistic",
 ]
-dependencies = ["sarvamai>=0.1.33"]
+# 0.1.49 is the first release with the Dictate clients (`client.dictate`,
+# `client.dictate_streaming`). The daemon imports the SDK lazily, but the floor
+# is the floor: an older SDK cannot dictate with the Dictate engine at all.
+dependencies = ["sarvamai>=0.1.49"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
