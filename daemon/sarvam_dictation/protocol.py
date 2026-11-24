@@ -36,6 +36,13 @@ ERROR_CODES = (
     "network",
     "api",
     "too_long",
+    # A setting that cannot work on the route about to run: a streaming model on
+    # the REST endpoint, a mode Dictate does not accept, a sample rate the
+    # socket refuses. The addon has always had a notification for this code, and
+    # the transcribers have always raised it -- but it was missing from this
+    # tuple, so ``_code_of`` refused to pass it through and the user was told
+    # "internal error" instead of which setting to change.
+    "config_invalid",
     "internal",
 )
 
