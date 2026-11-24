@@ -198,6 +198,14 @@ class DictationServer:
     too; the transcriber factory is called with the ``on_partial`` callback the
     server wants its partials delivered through.
 
+    The two transcriber factories are also where ``[api] engine`` is honoured.
+    They build ``DictateTranscriber``/``DictateRealtimeTranscriber`` when the
+    job's engine is ``dictate`` and ``SarvamTranscriber``/``RealtimeTranscriber``
+    when it is ``saaras``, and they read that engine from the job snapshot
+    (:meth:`_job_config`) rather than from the live config, so a ``reload`` can
+    switch engines between one dictation and the next without ever changing the
+    engine of work that is already in flight.
+
     ``config_path`` is the file ``reload`` re-reads. When it is not given the
     server uses the path its :class:`~sarvam_dictation.config.Config` was
     loaded from (so ``--config`` is honoured) and otherwise the built-in XDG
@@ -218,9 +226,7 @@ class DictationServer:
         self._config = config
         self._config_path = self._resolve_config_path(config, config_path)
         self._recorder_factory = recorder_factory or (lambda: Recorder(self._job_config()))
-        self._transcriber_factory = transcriber_factory or (
-            lambda: SarvamTranscriber(self._job_config())
-        )
+        self._transcriber_factory = transcriber_factory or self._new_transcriber
         self._stream_recorder_factory = stream_recorder_factory or self._new_stream_recorder
         self._stream_transcriber_factory = (
             stream_transcriber_factory or self._new_stream_transcriber
@@ -650,6 +656,33 @@ class DictationServer:
         logger.info("configuration reloaded from %s", path)
         await self._send(client, reloaded_msg(msg_id))
 
+    # ----------------------------------------------------------------- engines
+
+    def _new_transcriber(self):
+        """Build the file-based transcriber the job's engine asks for.
+
+        The engine is chosen per job, not at construction: ``reload`` can
+        switch ``[api] engine`` between one dictation and the next, while a
+        recording already in flight must still be transcribed by the engine it
+        started with. :meth:`_job_config` is that snapshot, so one call gives
+        both guarantees. The engine constant and the dictate route class are
+        imported here rather than at module scope for the reason brief section
+        2 makes a hard rule: the daemon must import on a machine that has none
+        of the optional transport packages, and a saaras-only install must not
+        pay for the dictate module.
+        """
+        from .config import ENGINE_DICTATE
+
+        config = self._job_config()
+        if config.engine == ENGINE_DICTATE:
+            from .dictate import DictateTranscriber
+
+            return DictateTranscriber(config)
+        # ``SarvamTranscriber`` is read from the module globals here on purpose:
+        # the existing tests patch it on this module to see which settings a
+        # transcription actually received.
+        return SarvamTranscriber(config)
+
     # --------------------------------------------------------------- streaming
 
     def _new_stream_recorder(self):
@@ -659,10 +692,25 @@ class DictationServer:
         return StreamingRecorder(self._job_config())
 
     def _new_stream_transcriber(self, on_partial):
-        """Build the real realtime transcriber, imported lazily (brief 7)."""
+        """Build the live transcriber the job's engine asks for.
+
+        The same per-job reasoning as :meth:`_new_transcriber` applies: a
+        ``reload`` may switch ``[api] engine`` between recordings, and the live
+        job in flight keeps the snapshot :meth:`_job_config` returns, so its
+        engine cannot change under it mid-sentence. Both routes are imported
+        lazily, and only the one the engine selected, so neither transport
+        package is needed to import the daemon.
+        """
+        from .config import ENGINE_DICTATE
+
+        config = self._job_config()
+        if config.engine == ENGINE_DICTATE:
+            from .dictate_streaming import DictateRealtimeTranscriber
+
+            return DictateRealtimeTranscriber(config, on_partial=on_partial)
         from .streaming import RealtimeTranscriber
 
-        return RealtimeTranscriber(self._job_config(), on_partial=on_partial)
+        return RealtimeTranscriber(config, on_partial=on_partial)
 
     async def _start_streaming(self, client: _Client, msg_id: str) -> bool:
         """Open a live recording for ``client``; called with the lock held.

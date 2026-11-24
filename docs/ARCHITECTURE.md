@@ -247,6 +247,86 @@ An empty result is legal, and it is the deadline that establishes it. "No finals
 The drain that feeds audio is given a much larger bound than a client-socket write, because the two timeouts cost different things. `_finish_drain` awaits the drain task, and a timeout there cancels it — but that task is what feeds captured audio into the socket, so cancelling it destroys speech the user has already spoken. A client-socket write that misses `DRAIN_TIMEOUT` is a different matter: what is lost there is the delivery of a message, not the audio, and the recording is intact. So the streaming drain is bounded by `STREAM_DRAIN_TIMEOUT`, well beyond the settle deadline, and when that expires the daemon logs a warning naming the risk rather than failing the recording, since the audio that did arrive is still worth transcribing and failing would throw that away as well.
 
 
+## The Dictate engine
+
+Saaras writes down what the recogniser heard. Dictate writes what the person
+meant to type: punctuation, no fillers or false starts, digits, the names from
+your own vocabulary, and optionally your formatting rules. Those are different
+products with different request shapes, so the daemon treats them as two
+*engines* rather than as two more models on one endpoint. `[api] engine` picks
+one, and everything downstream — the REST client, the socket client, the model
+namespace — follows from it.
+
+The switch is read per job, from the same snapshot every other setting uses. A
+`reload` therefore takes effect on the next recording and never in the middle of
+one, and the two engines never share a half-built client.
+
+### Why the wire protocol is written by hand
+
+The `sarvamai` SDK does ship Dictate clients, and for the Saaras routes the
+daemon uses the SDK. For Dictate it does not, for three reasons.
+
+The first is the SDK version. Dictate arrived in `sarvamai` 0.1.49, while the
+daemon's floor is 0.1.33, so using the SDK would silently raise the requirement
+for every user of the addon — including the people who never turn Dictate on.
+
+The second is testability. The whole point of the daemon's injectable-client
+pattern is that the test-suite never imports a network package; it passes a fake
+and asserts on what the fake was asked to do. A raw client keeps that property,
+and it keeps the failure modes visible: the URL, the query parameters, the auth
+header and the close codes are all in this repository where they can be read.
+
+The third is that the SDK's live socket hides the one thing this daemon needs to
+control: when the session ends. Dictate loses results if you close the socket
+without sending `end` and reading to `session.end`, so the finish path here is
+explicit — `speech_end`, then `end`, then read until `session.end` or a bounded
+timeout.
+
+Both transports are imported inside the method that uses them, so the daemon
+starts, and the suite runs, on a machine that has neither `httpx` nor
+`websockets` installed.
+
+### Manual endpointing, not VAD
+
+The addon is push-to-talk or record-and-send: one key press is one utterance.
+The Dictate socket can run its own voice-activity detection and cut turns on
+pauses, but that would bill the silence around a held key and split a sentence
+into several turns whenever the speaker breathes. The daemon therefore connects
+with `endpointing=manual`, sends `speech_start` when the session opens and
+`speech_end` when the key is released. One press, one turn, and only the audio
+between the two is billed.
+
+The `speech_start`/`speech_end` pair is legal *only* under manual endpointing —
+sent under `vad` the service answers `invalid_control` — which is why the
+endpointing mode and the message vocabulary are chosen together and never
+separately.
+
+### Turns are reassembled by index, not by arrival
+
+The socket labels every turn with `utterance_idx`, and the contract is explicit
+that a later turn's `transcript.final` can arrive before an earlier turn's
+`dictation.final`. Appending finals in arrival order would therefore put words
+in the wrong order in the user's text field. The client keeps finals in a
+dictionary keyed by `utterance_idx` and joins them in index order at the end.
+
+A turn that failed still produces exactly one `dictation.final`, with an empty
+text and a `degraded` reason. That is not an error to report: it is a turn that
+contributed nothing, and the rest of the dictation is still worth typing.
+
+### `text`, never `transcript`
+
+Every route returns two strings. `transcript` is what recognition heard;
+`text` is the finished version. The daemon types `text` and never falls back to
+`transcript` on its own: when the finishing step fails, the service sets
+`degraded` and puts the raw transcript *in* `text`, so the fallback has already
+happened inside the response. Reaching for `transcript` would quietly undo it.
+
+`output_rules` is a different feature with a different audience. When it is set,
+the socket sends one more event, `output.final`, holding a summary or a JSON
+record made from the whole recording. A dictation plugin must type what was
+said, so `output.final` is read — the read loop has to continue past it to reach
+`session.end` — and then discarded.
+
 ## Threading model
 
 The daemon is one asyncio loop, one task per client connection, and one worker thread at a time. Everything that touches the socket is a coroutine on the loop, so message handling is naturally serialised and the state machine needs no locks. Everything that blocks — spawning the recorder, waiting for it to exit, normalising the WAV, splitting it, calling the REST API — runs inside `asyncio.to_thread`. A streaming recording is the exception, and the exception is the point: its two jobs are a pipe read and a socket read, both of which are I/O the loop can wait on directly, so it adds two tasks to the loop rather than a worker thread. That is what keeps the loop responsive while a transcription is in flight: `ping` is answered and `cancel` is accepted throughout, which is what the protocol promises.
@@ -293,6 +373,8 @@ Transcription requires network access to Sarvam's API and a valid key. Nothing a
 The clipboard fallback is decided on focus alone. An application that holds a focused input context but discards committed text cannot be told apart from one that accepts it, because fcitx5 gives an addon no "a text widget is focused" bit and the capability flags are too rarely advertised on X11 to stand in for one. Nothing in the addon can detect that case; the *Always copy the transcript to the clipboard as well* option is the workaround, and it has to be turned on by the user.
 
 `config.toml` is the store for the daemon's settings and the addon's configuration page is the editor for them. The page does not merge a hand edit made while fcitx5 is running: pressing *Apply* writes the keys it manages from the values currently on the page. A hand edit made outside `fcitx5-configtool` is therefore best followed by `sarvam-dictation-ctl reload` rather than by *Apply*.
+
+The Dictate engine has no page in `fcitx5-configtool`. `[api] engine` and the whole `[dictate]` table are read from `config.toml` and survive an *Apply*, because the page writes only the keys it manages into the document it parsed, but nothing in the page sets them: switching engines is a hand edit followed by `sarvam-dictation-ctl reload`. A page for them would have to carry a style preset, a free-text rules box, a vocabulary list editor, two long text areas and a stream-type dropdown, which is a different kind of form from the single-column page the addon has now.
 
 ## Fcitx 5 version compatibility
 

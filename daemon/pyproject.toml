@@ -27,6 +27,9 @@ dependencies = ["sarvamai>=0.1.33"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# The Dictate engine only. The daemon imports both lazily, so a saaras-only
+# install needs neither: `pip install './daemon[dictate]'` turns the engine on.
+dictate = ["httpx>=0.27", "websockets>=12"]
 
 [project.scripts]
 sarvam-dictation-daemon = "sarvam_dictation.__main__:main"
