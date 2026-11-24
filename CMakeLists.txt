@@ -122,7 +122,9 @@ if(BUILD_TESTING)
         src/tomlfile.cpp
         # The audio-device annotation lives in the main page's description and
         # is defined here; without it the test binary fails to link.
-        src/audiodevices.cpp)
+        src/audiodevices.cpp
+        # ...and that file calls findInPath(), which lives in the notify helper.
+        src/desktopnotify.cpp)
 
     target_include_directories(engineconfig_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
