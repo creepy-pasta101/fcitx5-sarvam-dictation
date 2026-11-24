@@ -1,8 +1,9 @@
-"""Sarvam **Dictate** for a recorded clip: one ``POST /v2/dictate`` per chunk.
+"""Sarvam **Dictate** for a recorded clip: one ``client.dictate.transcribe`` per chunk.
 
-This is the Dictate twin of :mod:`sarvam_dictation.transcriber`. Both answer
-the same question — "here is a WAV, give me the text" — and both return a
-:class:`~sarvam_dictation.transcriber.Transcript`, raise
+This is the Dictate twin of :mod:`sarvam_dictation.transcriber`, and the two
+now share more than a shape: both go through the official ``sarvamai`` SDK.
+Both answer the same question — "here is a WAV, give me the text" — and both
+return a :class:`~sarvam_dictation.transcriber.Transcript`, raise
 :class:`~sarvam_dictation.transcriber.TranscriptionError` with a code from the
 daemon's fixed vocabulary, and split long audio with the *same* splitter. What
 differs is the service behind them: Saaras returns what recognition heard,
@@ -10,13 +11,19 @@ Dictate returns the text the speaker meant to type (punctuation, fillers
 dropped, names spelled the user's way). The daemon therefore picks a class,
 not a code path, and the rest of the daemon cannot tell the two apart.
 
-The transport is ``httpx``, imported lazily inside :meth:`DictateTranscriber.
-_post` so this module — and the whole test-suite — imports on a machine where
-``httpx`` is not installed (brief rule 2). A missing ``httpx`` at runtime is an
-``internal`` error with a ``pip install`` message, exactly like the missing
-``sarvamai`` SDK in :mod:`transcriber`. An injected ``client`` bypasses the
-transport entirely: tests hand in a fake and ``httpx`` is never imported, never
-constructed and never called.
+The SDK is imported lazily inside :meth:`DictateTranscriber._build_client` so
+this module — and the whole test-suite — imports on a machine where
+``sarvamai`` is not installed. A missing SDK at runtime is an ``internal``
+error carrying the ``pip install`` line the user needs, exactly like
+:mod:`transcriber`. An injected ``client`` bypasses the SDK entirely: tests
+hand in a fake and ``sarvamai`` is never imported, never constructed and never
+called.
+
+``text`` rather than ``transcript`` is the result. The response carries both:
+``transcript`` is what speech recognition heard, ``text`` is the finished
+version with punctuation, fillers removed and the user's names spelled their
+way — which is the whole reason the daemon offers a Dictate engine at all.
+Typing ``transcript`` would make this module a slower Saaras.
 
 Deliberately *not* done here:
 
@@ -30,11 +37,23 @@ Deliberately *not* done here:
   can never fall somewhere different on the two routes.
 * ``degraded`` is not surfaced. When the API could not run its finishing step
   it says so and sets ``text`` to the raw transcript, so the user still gets
-  usable text; turning that into an error would throw away a good result
-  (brief section 6, decision 4).
-* ``output`` is never typed. With ``output_rules`` set the API also returns a
-  summarised ``output`` object; a dictation plugin types what was *said*
-  (brief section 6, decision 3).
+  usable text; turning that into an error would throw away a good result.
+* ``output`` is never read. With ``output_rules`` set the API also returns a
+  summarised ``output`` object; a dictation plugin types what was *said*.
+
+Two places where the SDK does not do what the hand-written client did, and
+what this module does about it:
+
+* **Unset options are omitted, not passed as ``None``.** ``sarvamai`` 0.1.49
+  only skips an argument that was never supplied; a keyword explicitly set to
+  ``None`` is still encoded into the multipart body — as ``null`` for the JSON
+  parts and as an empty part for the text ones, both of which the API answers
+  with a ``400``. So :meth:`_transcribe_one` builds a ``kwargs`` dict and adds
+  an option only when it is set.
+* **The per-request timeout is passed explicitly.** The SDK's own default is
+  60 s, but the finishing step may legitimately take 90 s on its own, so
+  :data:`CLIP_TIMEOUT_S` is handed over as ``request_options`` and the
+  documented headroom survives the move to the SDK.
 
 The clip route takes at most 30 s of audio, so a longer recording is split into
 28 s chunks and each chunk is finished on its own. That is a real trade-off:
@@ -46,7 +65,6 @@ engines degrade in the same way.
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import wave
@@ -65,15 +83,13 @@ from .transcriber import (
 
 logger = logging.getLogger(__name__)
 
-#: The clip endpoint. No trailing slash: ``/v2/dictate/`` answers ``307`` to a
-#: plain ``http://`` address, which would send the API key in the clear.
-DICTATE_CLIP_URL = "https://api.sarvam.ai/v2/dictate"
-
 #: Seconds to wait for one chunk. The contract allows the finishing step up to
 #: 90 s on its own (and 90 s again for the ``output_rules`` call), so a 28 s
 #: clip can legitimately sit on the wire for well over a minute. 120 s clears
 #: that documented ceiling with headroom; anything tighter turns a slow-but-
 #: successful dictation into a spurious ``network`` error and loses the audio.
+#: Passed to the SDK as ``request_options``, whose own default (60 s) is too
+#: tight for this route.
 CLIP_TIMEOUT_S = 120.0
 
 #: The clip endpoint's own ceiling, in seconds. A recording that already fits is
@@ -86,13 +102,19 @@ CLIP_MAX_SECONDS = 30.0
 
 
 def style_payload(config: Config) -> dict | None:
-    """Return the ``style`` form part, or ``None`` when the user set nothing.
+    """Return the ``style`` value, or ``None`` when the user set nothing.
 
     Shape from the API contract (§1 and §3): ``{"preset": ...}`` where ``preset``
     is one of ``none``/``light``/``clean``, and ``{"rules": ...}`` for free-text
     formatting instructions. Each member is omitted when unset, because the
     contract refuses ``preset = ""`` and an empty part altogether; ``None``
     tells the caller to leave the field off the request entirely.
+
+    A plain dict is returned rather than a ``DictateStyle`` on purpose: the SDK
+    serialises a dict to exactly the JSON the hand-written client used to send,
+    it keeps the ``sarvamai`` import out of a function the test-suite calls on a
+    machine without the SDK, and the live-socket unit can hand the same dict
+    straight to ``DictateConfigUpdate``, which validates dicts too.
     """
     payload: dict[str, object] = {}
     preset = (config.dictate_style or "").strip()
@@ -105,12 +127,14 @@ def style_payload(config: Config) -> dict | None:
 
 
 def vocabulary_payload(config: Config) -> list | None:
-    """Return the ``vocabulary`` form part, or ``None`` when there are no terms.
+    """Return the ``vocabulary`` value, or ``None`` when there are no terms.
 
     Shape from the API contract (§1 and §3): an array of objects, of which only
     ``word`` is required. Our configuration exposes the simple form — a list of
     the user's names and terms — so each string becomes ``{"word": s}``;
     ``sounds_like`` and ``description`` are left out rather than guessed.
+
+    Plain dicts for the same three reasons as :func:`style_payload`.
     """
     entries = [
         {"word": term.strip()}
@@ -121,13 +145,15 @@ def vocabulary_payload(config: Config) -> list | None:
 
 
 def context_payload(config: Config) -> dict | None:
-    """Return the ``context`` form part, or ``None`` when both members are unset.
+    """Return the ``context`` value, or ``None`` when both members are unset.
 
     Shape from the API contract (§1 and §3): ``{"text": ..., "reference": ...}``
     where ``text`` is one line about the situation and ``reference`` is a plain
     document carrying names and terms. Either member may be omitted; an empty
     string is not a legal value, so unset members are dropped rather than sent
     blank.
+
+    A plain dict for the same three reasons as :func:`style_payload`.
     """
     payload: dict[str, object] = {}
     text = (config.dictate_context or "").strip()
@@ -142,8 +168,9 @@ def context_payload(config: Config) -> dict | None:
 class DictateTranscriber:
     """Transcribes one recorded clip through Sarvam's Dictate API.
 
-    ``client`` may be injected (tests pass a fake with a ``post`` method); when
-    it is, ``httpx`` is never imported and no network call is ever made.
+    ``client`` may be injected (tests pass a fake exposing a
+    ``dictate.transcribe(**kwargs)`` method); when it is, the SDK is never
+    imported and no network call is ever made.
     """
 
     def __init__(self, config: Config, client=None) -> None:
@@ -151,7 +178,7 @@ class DictateTranscriber:
         self._client = client
 
     def transcribe(self, path: Path) -> Transcript:
-        """Transcribe ``path``, one ``POST`` per <=28 s chunk.
+        """Transcribe ``path``, one ``dictate.transcribe`` per <=28 s chunk.
 
         Every configuration mistake is reported before the file is opened and
         before any request is built, so the user sees "this setting cannot
@@ -180,10 +207,13 @@ class DictateTranscriber:
             if len(chunks) > 1:
                 # split_wav made a fresh temp dir for us; we own removing it.
                 created_dir = chunks[0].parent
+            # Built once for the whole clip: the SDK client holds the HTTP
+            # connection pool, so one per chunk would be wasted work.
+            client = self._build_client()
             texts: list[str] = []
             language_code: str | None = None
             for chunk in chunks:
-                text, chunk_language = self._transcribe_one(chunk)
+                text, chunk_language = self._transcribe_one(client, chunk)
                 texts.append(text)
                 if language_code is None and chunk_language:
                     # First non-empty answer wins: a clip is one utterance, and
@@ -232,35 +262,61 @@ class DictateTranscriber:
             code="config_invalid",
         )
 
-    def _form_fields(self) -> dict[str, str]:
-        """Build the non-file form parts, omitting every unset option.
+    def _build_client(self):
+        """Return the injected client, or construct one with the lazily imported SDK."""
+        if self._client is not None:
+            return self._client
+        try:
+            from sarvamai import SarvamAI  # imported here so the SDK stays optional
+        except ModuleNotFoundError as exc:
+            raise TranscriptionError(
+                "the sarvamai SDK is not installed (pip install 'sarvamai>=0.1.49'); "
+                "the Dictate clip route needs it",
+                code="internal",
+            ) from exc
+        try:
+            return SarvamAI(api_subscription_key=self._config.api_key)
+        except Exception as exc:  # SDK raises its own types on bad credentials
+            raise TranscriptionError(
+                f"cannot create the Sarvam client: {self._scrub(str(exc))}", code="api"
+            ) from exc
 
-        An empty string part is a 400 on this route (contract §1), so "unset"
-        must mean "absent from the request", never "present but empty".
+    def _request_options(self) -> dict:
+        """Per-request options: the route's own timeout, not the SDK's 60 s default."""
+        return {"timeout_in_seconds": int(CLIP_TIMEOUT_S)}
+
+    def _transcribe_one(self, client, chunk: Path) -> tuple[str, str | None]:
+        """Transcribe a single chunk, mapping SDK failures onto our codes.
+
+        Only the options the user actually set are passed. ``sarvamai`` 0.1.49
+        does not strip a keyword that was explicitly ``None`` — it encodes it
+        as ``null``/empty in the multipart body, which the API refuses with a
+        400 — so "unset" has to mean "absent from the call", exactly as it
+        meant "absent from the form" before.
         """
-        fields: dict[str, str] = {"mode": self._config.mode}
+        kwargs: dict[str, object] = {
+            "mode": self._config.mode,
+            "request_options": self._request_options(),
+        }
         if self._config.language_code:
-            # Empty means "detect": omitting the part lets the API autodetect,
+            # Empty means "detect": omitting the option lets the API autodetect,
             # while sending "" would be refused outright.
-            fields["language_code"] = self._config.language_code
+            kwargs["language_code"] = self._config.language_code
         if self._config.dictate_output_rules.strip():
-            fields["output_rules"] = self._config.dictate_output_rules
+            kwargs["output_rules"] = self._config.dictate_output_rules
         if self._config.dictate_model.strip():
-            fields["model"] = self._config.dictate_model
+            kwargs["model"] = self._config.dictate_model
         for name, payload in (
             ("style", style_payload(self._config)),
             ("vocabulary", vocabulary_payload(self._config)),
             ("context", context_payload(self._config)),
         ):
             if payload is not None:
-                # JSON text parts: the API parses these, so they must be
-                # serialised strings, not form-encoded structures.
-                fields[name] = json.dumps(payload, ensure_ascii=False)
-        return fields
+                # Dicts, not DictateStyle/DictateVocabularyEntry/DictateContext:
+                # the SDK serialises them to the same JSON parts the contract
+                # documents, and this module stays importable without the SDK.
+                kwargs[name] = payload
 
-    def _transcribe_one(self, chunk: Path) -> tuple[str, str | None]:
-        """Transcribe a single chunk, mapping transport failures onto our codes."""
-        fields = self._form_fields()
         try:
             handle = open(chunk, "rb")
         except OSError as exc:
@@ -268,102 +324,51 @@ class DictateTranscriber:
                 f"cannot read audio chunk {chunk}: {exc}", code="internal"
             ) from exc
         with handle:
-            files = {"file": (chunk.name, handle, "audio/wav")}
             try:
-                response = self._post(files, fields)
+                response = client.dictate.transcribe(file=handle, **kwargs)
             except TranscriptionError:
-                # Already ours and already actionable (a missing ``httpx``, say):
-                # mapping it again would bury the message under "unexpected".
+                # Already ours and already actionable: mapping it again would
+                # bury the message under "unexpected".
                 raise
-            except Exception as exc:  # transport errors are mapped, never leaked
+            except Exception as exc:  # SDK/transport errors are mapped, never leaked
                 raise self._map_exception(exc) from exc
+
         return self._read_response(response)
 
-    def _post(self, files: dict, fields: dict[str, str]):
-        """Send one chunk: through the injected client, else through ``httpx``."""
-        headers = {"api-subscription-key": self._config.api_key}
-        if self._client is not None:
-            return self._client.post(
-                DICTATE_CLIP_URL,
-                headers=headers,
-                data=fields,
-                files=files,
-                timeout=CLIP_TIMEOUT_S,
-            )
-        httpx = self._import_httpx()
-        return httpx.post(
-            DICTATE_CLIP_URL,
-            headers=headers,
-            data=fields,
-            files=files,
-            timeout=CLIP_TIMEOUT_S,
-        )
-
-    def _import_httpx(self):
-        """Import ``httpx`` here so the module stays importable without it."""
-        try:
-            import httpx
-        except ModuleNotFoundError as exc:
-            raise TranscriptionError(
-                "the httpx package is not installed (pip install 'httpx>=0.27'); "
-                "the Dictate clip route needs it",
-                code="internal",
-            ) from exc
-        return httpx
-
     def _read_response(self, response) -> tuple[str, str | None]:
-        """Read ``text`` and ``language_code`` off a 200, defensively.
+        """Read ``text`` and ``language_code`` off a successful response.
+
+        ``text`` is the result: it is the finished dictation, and it is what the
+        user pastes. ``transcript`` is only a fallback for a response that does
+        not carry ``text`` at all, so an undocumented shape still yields
+        something rather than nothing.
 
         ``degraded`` is deliberately not read: when it is set, ``text`` already
-        holds the raw transcript, so the result is still usable text. A 200
-        with an empty ``text`` is a legitimate answer for a clip of pure
-        background noise and must not become an error.
+        holds the raw transcript, so the result is still usable text. An empty
+        ``text`` is a legitimate answer for a clip of pure background noise and
+        must not become an error. ``output`` is ignored — it is the summarised
+        artefact, not what was said.
         """
-        status = getattr(response, "status_code", None)
-        body = self._body(response)
-        if isinstance(status, int) and not isinstance(status, bool) and status >= 400:
-            raise self._http_error(status, self._error_message(body))
-        if not body:
-            # A 2xx whose body is not a JSON object is not an empty transcript:
-            # it is a proxy page, a truncated response or a shape we do not
-            # know. Reporting it as empty text would drop the user's audio
-            # silently, which is the one outcome worth failing loudly for.
-            raise TranscriptionError(
-                f"Sarvam sent a response that was not readable JSON (HTTP {status})",
-                code="api",
-            )
-
-        text = body.get("text")
+        text = getattr(response, "text", None)
         if not isinstance(text, str):
-            # Undocumented shape: fall back to the raw transcript rather than
-            # dropping a result the API did send.
-            fallback = body.get("transcript")
+            fallback = getattr(response, "transcript", None)
             text = fallback if isinstance(fallback, str) else ""
-        language_code = body.get("language_code")
+        language_code = getattr(response, "language_code", None)
         if not isinstance(language_code, str) or not language_code:
             language_code = None
         return text, language_code
 
-    def _body(self, response) -> dict:
-        """Return the JSON body as a dict, or ``{}`` when it is not one."""
-        try:
-            body = response.json()
-        except Exception:  # a proxy's HTML error page, an empty body, ...
-            return {}
-        return body if isinstance(body, dict) else {}
-
-    def _error_message(self, body: dict) -> str:
-        """Pull ``error.message`` out of a documented error body."""
-        error = body.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str) and message:
-                return self._scrub(message)
-        return ""
-
     def _map_exception(self, exc: Exception) -> TranscriptionError:
-        """Convert a transport exception into a TranscriptionError."""
-        message = self._scrub(str(exc)) or exc.__class__.__name__
+        """Convert an SDK or transport exception into a TranscriptionError.
+
+        ``sarvamai`` raises ``sarvamai.core.api_error.ApiError`` (and its
+        ``BadRequestError``/``ForbiddenError``/... subclasses) for every
+        non-2xx answer: ``.status_code`` names the status and ``.body`` carries
+        the documented ``{"error": {"message": ...}}`` object. Transport
+        failures are not wrapped — the SDK lets ``httpx``'s own exceptions out —
+        so the shared classifier in :mod:`transcriber` recognises both.
+        """
+        message = self._error_message(exc) or self._scrub(str(exc)) or exc.__class__.__name__
         status = _status_code(exc)
         if status is not None:
             return self._http_error(status, message)
@@ -375,6 +380,23 @@ class DictateTranscriber:
             f"unexpected error from the Dictate request ({exc.__class__.__name__}): {message}",
             code="internal",
         )
+
+    def _error_message(self, exc: Exception) -> str:
+        """Pull ``error.message`` out of an ``ApiError``'s body, scrubbed.
+
+        Preferred over ``str(exc)`` because ``ApiError.__str__`` prints the
+        whole response header dict, which is noise in a desktop notification.
+        Returns ``""`` when the body does not follow the documented shape, so
+        the caller falls back to the exception's own text.
+        """
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return self._scrub(message)
+        return ""
 
     def _http_error(self, status: int, message: str) -> TranscriptionError:
         """Map an HTTP status onto the daemon's codes, keeping the status visible."""

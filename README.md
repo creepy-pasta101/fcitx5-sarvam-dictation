@@ -24,7 +24,7 @@ The wire protocol between the two is a frozen contract and is documented in [doc
 
 You need Fcitx 5 installed and running, a C++17 compiler with CMake 3.19 or newer, and the fcitx5 development headers so the addon can be built. On Debian and Ubuntu the headers come from `libfcitx5core-dev`, `libfcitx5config-dev`, `libfcitx5utils-dev` and `fcitx5-modules-dev`; on Fedora it is `fcitx5-devel`; on Arch the headers ship with the `fcitx5` package. Distribution package names vary between releases, so if one of these does not exist on your system, search your package manager for `fcitx5` development files — the build only needs `Fcitx5Core` and the `Notifications` module of `Fcitx5Module`.
 
-The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai). Dictation over the REST endpoint works with any valid key; the optional streaming mode additionally needs a subscription that includes realtime access. If you switch the daemon to the Dictate engine (`[api] engine = "dictate"`), it also needs `httpx` and `websockets` on the same interpreter — see [Dictate settings](#dictate-settings).
+The daemon needs Python 3.10 or newer. It uses only the standard library, plus the official `sarvamai` SDK, which it imports lazily so that the daemon starts and its test suite runs even when the SDK is not installed. For audio you need PipeWire, PulseAudio or ALSA with one of `pw-record`, `parec` or `arecord` on your `PATH`; the daemon picks whichever it finds first. Finally you need a Sarvam AI API key, which you can create at [dashboard.sarvam.ai](https://dashboard.sarvam.ai). Dictation over the REST endpoint works with any valid key; the optional streaming mode additionally needs a subscription that includes realtime access. The Dictate engine needs `sarvamai` 0.1.49 or newer — the first release that ships the Dictate clients. An older SDK answers with a clear error rather than a wrong transcript — see [Dictate settings](#dictate-settings).
 
 Whichever of the three the daemon resolves, it runs it so that what comes back is bare audio rather than a container: `parec --raw`, `arecord -t raw` and `pw-record --raw`. The PipeWire flag is the one worth knowing about, because it is the one that is easy to leave out and its absence is not obvious from the command. `pw-record` is `pw-cat`, and `pw-cat` picks what to write from the name it is given; the streaming path gives it `-`, and with no container named, `-` means the Sun/NeXT AU container. Without `--raw` the command therefore writes a libsndfile AU file to standard output — a header followed by samples in that container's byte order — where the streaming path expects raw little-endian 16-bit samples. `--raw` is what turns the same invocation into a bare PCM stream.
 
@@ -141,13 +141,13 @@ These are the settings the daemon reads from `~/.config/sarvam-dictation/config.
 
 `[api] engine = "dictate"` switches the daemon from Saaras to Sarvam's Dictate API. Dictate returns the text a person meant to type rather than a transcript: punctuation, no fillers or false starts, digits instead of spoken numbers, and your names spelled your way. The settings below live in their own `[dictate]` table because they only mean anything to that engine; with `engine = "saaras"` they are read and ignored.
 
-Dictate needs two Python packages the daemon does not install for you, `httpx` (for the clip route) and `websockets` (for the live route). Install them for the interpreter the daemon runs under:
+Dictate talks to Sarvam through the same `sarvamai` SDK as everything else, so there is nothing extra to install — but the SDK must be 0.1.49 or newer, the first release with the Dictate clients. Upgrade it for the interpreter the daemon runs under:
 
 ```bash
-pip install httpx websockets
+pip install -U 'sarvamai>=0.1.49'
 ```
 
-They are imported only when the engine is `dictate`, so a Saaras-only install needs neither.
+With an older SDK the daemon still starts and still dictates on the Saaras engine; a Dictate dictation fails with a notification telling you to upgrade.
 
 | Setting | `config.toml` key | Default | Meaning |
 |---|---|---|---|

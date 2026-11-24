@@ -261,30 +261,22 @@ The switch is read per job, from the same snapshot every other setting uses. A
 `reload` therefore takes effect on the next recording and never in the middle of
 one, and the two engines never share a half-built client.
 
-### Why the wire protocol is written by hand
+### Through the SDK, like every other route
 
-The `sarvamai` SDK does ship Dictate clients, and for the Saaras routes the
-daemon uses the SDK. For Dictate it does not, for three reasons.
+Dictate goes through `sarvamai`, the same SDK the two Saaras routes use. The
+first version of this engine spoke the wire protocol by hand, because Dictate
+arrived in `sarvamai` 0.1.49 while the daemon's floor was 0.1.33 — a hand-written
+client kept the requirement low. That trade was then settled the other way: one
+SDK everywhere is worth the floor bump, because the request and event models are
+maintained upstream, a change to the service arrives as an SDK release rather
+than as a silent break in a hand-rolled frame, and there is exactly one way in
+this repository to talk to Sarvam.
 
-The first is the SDK version. Dictate arrived in `sarvamai` 0.1.49, while the
-daemon's floor is 0.1.33, so using the SDK would silently raise the requirement
-for every user of the addon — including the people who never turn Dictate on.
-
-The second is testability. The whole point of the daemon's injectable-client
-pattern is that the test-suite never imports a network package; it passes a fake
-and asserts on what the fake was asked to do. A raw client keeps that property,
-and it keeps the failure modes visible: the URL, the query parameters, the auth
-header and the close codes are all in this repository where they can be read.
-
-The third is that the SDK's live socket hides the one thing this daemon needs to
-control: when the session ends. Dictate loses results if you close the socket
-without sending `end` and reading to `session.end`, so the finish path here is
-explicit — `speech_end`, then `end`, then read until `session.end` or a bounded
-timeout.
-
-Both transports are imported inside the method that uses them, so the daemon
-starts, and the suite runs, on a machine that has neither `httpx` nor
-`websockets` installed.
+The floor is now `sarvamai>=0.1.49`. The import stays lazy — inside the method
+that builds the client, never at module scope — so the daemon starts, and the
+test-suite runs, on a machine without the SDK; a Dictate dictation on such a
+machine fails with a notification naming the upgrade rather than with a stack
+trace.
 
 ### Manual endpointing, not VAD
 

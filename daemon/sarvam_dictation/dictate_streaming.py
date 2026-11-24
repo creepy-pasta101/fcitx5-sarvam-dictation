@@ -1,35 +1,45 @@
 """Live (streaming) Dictate transcription for the dictation daemon.
 
-:mod:`sarvam_dictation.streaming` opens a WebSocket to Sarvam's Saaras realtime
-endpoint and reports raw partial transcripts while the user is still speaking.
-This module is its twin for the **Dictate** socket at
-``wss://api.sarvam.ai/v2/dictate/ws``. It keeps the same shape - ``open()``,
-``feed(pcm)``, ``finish()``, ``cancel()``, a hand-entered session, a background
-receiver task, an injectable ``client`` - and differs only where the Dictate
-protocol itself differs: the text it returns is the text the user *meant to
-type* (punctuation, no fillers, the user's own spellings) rather than a
-transcript, and a turn is closed by a ``dictation.final`` rather than by a
-``transcript.final``. The two modules must stay recognisably the same piece of
-code, because the daemon drives both through one interface.
+:mod:`sarvam_dictation.streaming` opens Sarvam's Saaras realtime socket through
+the ``sarvamai`` SDK and reports raw partial transcripts while the user is still
+speaking. This module is its twin for the **Dictate** socket. It keeps the same
+shape - ``open()``, ``feed(pcm)``, ``finish()``, ``cancel()``, a hand-entered
+async context manager, a background receiver task, an injectable ``client`` -
+and differs only where the Dictate protocol itself differs: the text it returns
+is the text the user *meant to type* (punctuated, fillers dropped, the user's
+own spellings) rather than a transcript, and a turn is closed by a
+``dictation.final`` rather than by a ``transcript.final``. The two modules must
+stay recognisably the same piece of code, because the daemon drives both
+through one interface, and both now talk to a Sarvam socket the same way: the
+SDK's ``client.dictate_streaming.connect(...)`` / ``client.
+speech_to_text_realtime_streaming.connect(...)`` context manager, the SDK's
+request models, and ``recv()`` handing back the SDK's event models. Nothing
+here builds a URL, a query string, a header dict or a JSON frame - the SDK owns
+the transport.
 
 The session is opened with ``endpointing=manual``. The addon is push-to-talk or
 toggle: one key press is one turn, so the daemon says when speech starts
 (``speech_start``) and when it stops (``speech_end``) instead of letting the
 server guess from a pause. That is also what makes the billing honest - the
 server only turns audio it was told to expect into a turn, so only the audio the
-user actually dictated is billed, not the silence between presses.
+user actually dictated is billed, not the silence between presses. (``vad``
+would also refuse those two control messages outright, and would cut a long
+utterance at 18-20 s even inside a word.)
 
-Four properties shape the implementation:
+Turns are reassembled by ``utterance_idx``, never by arrival order. The
+contract warns that a later turn's ``transcript.final`` can arrive *before* an
+earlier turn's ``dictation.final``, so :meth:`DictateRealtimeTranscriber.finish`
+sorts the finished turns by index before joining them. Arrival order says
+nothing about the order of speech.
 
-* ``websockets`` is imported lazily, inside :meth:`DictateRealtimeTranscriber.open`
-  (through ``_resolve_connector``). Importing this module, and every test of it,
-  works on a machine where the package is not installed. When a ``client`` is
-  injected the package is never imported at all: the injected connector hands
-  back the connection and the real transport is never constructed.
-* Turns are reassembled by ``utterance_idx``, never by arrival order. The
-  contract warns that a later turn's ``transcript.final`` can arrive *before* an
-  earlier turn's ``dictation.final``, so :meth:`DictateRealtimeTranscriber.finish`
-  sorts the finished turns before joining them.
+Four more properties shape the implementation:
+
+* ``sarvamai`` is imported lazily, inside
+  :meth:`DictateRealtimeTranscriber._resolve_client`. Importing this module, and
+  every test of it, works on a machine where the SDK is not installed. When a
+  ``client`` is injected the SDK is never imported, constructed or called at
+  all: the injected object supplies ``dictate_streaming.connect`` and the
+  request models are replaced by wire-compatible stand-ins.
 * ``output.final`` is read and thrown away. When the user configures
   ``output_rules`` the socket emits a rewritten output before ``session.end``;
   a dictation plugin types what was said, not a summary of it, so the text of
@@ -41,20 +51,30 @@ Four properties shape the implementation:
   that have not been sent yet, and the output call behind ``output_rules`` can
   take up to 90 s, which is why the wait for ``session.end`` is bounded
   generously rather than tightly.
-
-Two smaller ones worth knowing before reading the code: every audio message
-carries at most 1 s of audio (0.5 s with ``stream_type=fast``), so ``feed()``
-buffers the recorder's chunks into blocks of exactly that size rather than
-trusting the recorder to respect a limit it knows nothing about - an oversized
-message is answered with ``chunk_too_large`` and the audio in it is lost. And a
-keepalive task pings the socket, because the server closes a session that has
-been quiet for 60 s (``1008``) and a user who opens the session and then thinks
-about what to say should not lose it.
+* Every audio message carries at most 1 s of audio (0.5 s with
+  ``stream_type=fast``), so ``feed()`` buffers the recorder's chunks into blocks
+  of exactly that size rather than trusting the recorder to respect a limit it
+  knows nothing about - an oversized message is answered with
+  ``chunk_too_large`` and the audio in it is lost. A keepalive task pings the
+  socket, because the server closes a session that has been quiet for 60 s
+  (``1008``) and a user who opens the session and then thinks about what to say
+  should not lose it.
 
 A partial dictation is better than no dictation: when a fatal ``error`` arrives
 or the socket dies with a non-1000 close code *after* at least one turn has been
 finished, :meth:`finish` returns what it has and logs the failure instead of
 raising. It raises only when there is nothing to return.
+
+Every SDK call made here is checked against ``sarvamai`` 0.1.49:
+``AsyncSarvamAI(api_subscription_key=...).dictate_streaming.connect()`` is an
+``@asynccontextmanager`` taking ``language_code``, ``mode``, ``model``,
+``endpointing``, ``stream_type``, ``encoding`` and ``sample_rate`` (a *string*);
+the socket it yields has ``update_config``, ``speech_start``, ``send_audio``,
+``speech_end``, ``end``, ``ping`` and ``recv()``, and ``recv()`` returns the
+``Dictate*`` event dataclasses (``DictateSessionBegin``,
+``DictateConfigUpdated``, ``DictateTranscriptPartial``, ``DictateDictationFinal``,
+``DictateOutputFinal``, ``DictateSessionEnd``, ``DictateError``), which are also
+accepted here as plain dicts.
 """
 
 from __future__ import annotations
@@ -63,12 +83,9 @@ import asyncio
 import base64
 import contextlib
 import errno as _errno
-import inspect
-import json
 import logging
 import socket
 from typing import Any, Callable
-from urllib.parse import urlencode
 
 from .config import (
     DEFAULT_DICTATE_LANGUAGE,
@@ -82,11 +99,6 @@ from .streaming import StreamingError, Transcript
 
 logger = logging.getLogger(__name__)
 
-#: The Dictate live socket. No trailing slash and no query string: the query is
-#: built per session in :meth:`DictateRealtimeTranscriber._url`, because
-#: ``endpointing`` and ``model`` cannot be changed after the handshake.
-DICTATE_WS_URL = "wss://api.sarvam.ai/v2/dictate/ws"
-
 #: ``linear16`` is raw little-endian signed 16-bit PCM, mono, at ``sample_rate``
 #: - exactly what the capture tools write, so no WAV header is ever added. The
 #: contract allows ``linear32``/``mulaw``/``alaw`` too; the recorder produces
@@ -97,6 +109,10 @@ DEFAULT_ENCODING = "linear16"
 #: Under ``vad`` the ``speech_start``/``speech_end`` control messages are refused
 #: with ``invalid_control``, so this value and those two messages are one decision.
 DEFAULT_ENDPOINTING = "manual"
+
+#: The SDK release that ships the Dictate clients. The daemon's floor, quoted in
+#: the "SDK missing" message so the notification tells the user what to install.
+SDK_REQUIREMENT = "sarvamai>=0.1.49"
 
 #: Bytes per sample for ``linear16`` mono: what turns a duration into the byte
 #: budget of one ``audio_input`` message in
@@ -132,7 +148,21 @@ SESSION_END_TIMEOUT_S = 120.0
 #: inside the window. Half the limit, so one lost ping is not fatal either.
 KEEPALIVE_INTERVAL_S = 30.0
 
-#: Exception class names (websockets/httpx style) meaning "the link is gone".
+#: The wire name of each request the socket sends. The model factories in
+#: ``_models`` are keyed by a Python identifier (``config.update`` is not one),
+#: so the stand-in built for an injected client needs the mapping to say
+#: ``{"event": "config.update"}`` exactly as the SDK's own model does.
+_REQUEST_EVENTS = {
+    "audio_input": "audio_input",
+    "speech_start": "speech_start",
+    "speech_end": "speech_end",
+    "end": "end",
+    "ping": "ping",
+    "config_update": "config.update",
+}
+
+#: Exception class names (transport style, whatever library the SDK uses
+#: underneath) meaning "the link is gone".
 _NETWORK_EXCEPTION_NAMES = frozenset(
     {
         "ConnectionClosed",
@@ -150,6 +180,7 @@ _NETWORK_EXCEPTION_NAMES = frozenset(
         "ReadTimeout",
         "Timeout",
         "TimeoutError",
+        "TimeoutException",
         "TransportError",
         "WebSocketException",
     }
@@ -169,18 +200,44 @@ _NETWORK_ERRNOS = frozenset(
 )
 
 
+class _Request:
+    """Stand-in for the SDK's request models when the SDK is not in play.
+
+    The real socket client only ever calls ``data.dict()`` and hands the result
+    to ``json.dumps`` (``AsyncDictateStreamingSocketClient._send_model``), so any
+    object with a ``dict()`` method is wire-compatible. Injecting a fake client
+    therefore never needs the SDK to be importable - which is the whole point of
+    the injected-client path, since the daemon's test suite runs on machines
+    without the SDK installed.
+    """
+
+    def __init__(self, **fields: Any) -> None:
+        self._fields = fields
+        # The real models are plain attributes (``message.event``,
+        # ``message.audio``), so the stand-in keeps the same shape.
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+    def dict(self) -> dict[str, Any]:
+        """Return the JSON body this request would be sent as (``None`` dropped)."""
+        return {name: value for name, value in self._fields.items() if value is not None}
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"_Request({self.dict()!r})"
+
+
 class DictateRealtimeTranscriber:
     """Transcribes raw PCM into dictation text while it is being captured,
-    through Sarvam's Dictate live WebSocket. One instance per recording.
+    through Sarvam's Dictate live socket. One instance per recording.
 
     ``on_partial`` is called from the receiver task with the best current
     preview - the turns that have finished, plus the text of the turn in flight,
     already stripped and never empty - and may be called from any task. ``client``
-    may be injected (tests pass a fake); when it is, ``websockets`` is never
-    imported and no network call is ever made. An injected client is a
-    *connector*: a callable (or an object with a ``connect`` method) taking the
-    URL and ``additional_headers=`` and returning the connection, or an awaitable
-    resolving to it.
+    may be injected (tests pass a fake); when it is, the ``sarvamai`` SDK is never
+    imported and no network call is ever made. An injected client models the SDK:
+    an object whose ``dictate_streaming.connect(**kwargs)`` is an async context
+    manager yielding a socket with ``update_config``/``speech_start``/
+    ``send_audio``/``speech_end``/``end``/``ping`` and ``recv()``.
     """
 
     def __init__(
@@ -192,6 +249,9 @@ class DictateRealtimeTranscriber:
         self._config = config
         self._on_partial = on_partial
         self._client = client
+        #: request-model factories, filled in only when the SDK itself is used.
+        self._models: dict[str, Any] = {}
+        self._ctx: Any = None
         self._ws: Any = None
         self._receiver: asyncio.Task[None] | None = None
         self._keepalive: asyncio.Task[None] | None = None
@@ -238,24 +298,41 @@ class DictateRealtimeTranscriber:
         # Built before connecting: the builders live in the sibling clip module,
         # and a missing one is a broken installation, not a reason to open a
         # socket we would only have to tear down again.
-        update = self._config_update()
+        fields = self._config_fields()
 
-        connector = self._resolve_connector()
-        url = self._url()
-        headers = {"api-subscription-key": (self._config.api_key or "").strip()}
-        # The key travels in the header only: the contract refuses a key in the
-        # query string with 403, and a URL is the one thing that ends up in logs.
+        client = self._resolve_client()
+        service = getattr(client, "dictate_streaming", None)
+        connect = getattr(service, "connect", None)
+        if connect is None:
+            raise StreamingError(
+                "the Sarvam client has no dictate_streaming.connect(); the "
+                f"installed {SDK_REQUIREMENT.split('>=')[0]} is too old for the "
+                "Dictate socket - upgrade it with "
+                f"pip install '{SDK_REQUIREMENT}'",
+                code="internal",
+            )
+
+        # The models only exist once the client has been resolved: an injected
+        # client supplies its own objects, so this is a stand-in for it.
+        update = self._event("config_update", **fields) if fields else None
+
+        kwargs = self._connect_kwargs()
+        # The key travels inside the SDK, never in a URL we build: the contract
+        # refuses a key in the query string with 403, and a URL is the one thing
+        # that ends up in logs.
         logger.debug(
             "opening Dictate session (mode=%s, sample_rate=%s, stream_type=%s)",
-            self._config.mode,
-            self._config.sample_rate,
-            self._stream_type(),
+            kwargs.get("mode"),
+            kwargs.get("sample_rate"),
+            kwargs.get("stream_type"),
         )
         try:
-            ws = await _connect(connector, url, headers)
-        except Exception as exc:  # handshake/auth/transport failures are mapped
+            ctx = connect(**kwargs)
+            ws = await ctx.__aenter__()
+        except Exception as exc:  # connect/auth/transport failures are mapped
             raise self._map_exception(exc) from exc
 
+        self._ctx = ctx
         self._ws = ws
         self._receiver = asyncio.ensure_future(self._receive())
         self._keepalive = asyncio.ensure_future(self._ping_loop())
@@ -274,31 +351,34 @@ class DictateRealtimeTranscriber:
                 # the session go on over a socket the server has given up on.
                 raise self._error
 
-            # One update carrying every setting: the contract checks the whole
-            # update atomically and refuses a second one before config.updated.
-            self._awaiting_config_updated = True
-            await self._send(update)
-            if not await self._wait_for(self._config_event, CONFIG_UPDATED_TIMEOUT_S):
-                raise StreamingError(
-                    "the Dictate socket did not confirm config.update with "
-                    f"config.updated within {CONFIG_UPDATED_TIMEOUT_S:.0f}s",
-                    code="api",
-                )
-            self._awaiting_config_updated = False
-            if self._error is not None:
-                raise self._error
-            if self._config_error is not None:
-                # A no-op update is answered with invalid_config by the contract,
-                # which happens whenever the user has configured nothing at all.
-                # Refusing to dictate over that would be absurd: the settings are
-                # optional, so a rejected update is logged and the session goes on
-                # with the server's defaults.
-                logger.warning(
-                    "Dictate did not apply config.update: %s", self._config_error
-                )
+            if update is not None:
+                # One update carrying every setting: the contract checks the
+                # whole update atomically and refuses a second one before
+                # config.updated. With nothing configured there is nothing to
+                # send - and the service refuses an update that changes nothing.
+                self._awaiting_config_updated = True
+                await ws.update_config(update)
+                if not await self._wait_for(self._config_event, CONFIG_UPDATED_TIMEOUT_S):
+                    raise StreamingError(
+                        "the Dictate socket did not confirm config.update with "
+                        f"config.updated within {CONFIG_UPDATED_TIMEOUT_S:.0f}s",
+                        code="api",
+                    )
+                self._awaiting_config_updated = False
+                if self._error is not None:
+                    raise self._error
+                if self._config_error is not None:
+                    # A no-op update is answered with invalid_config by the
+                    # contract, which happens whenever the user has configured
+                    # little or nothing. Refusing to dictate over that would be
+                    # absurd: the settings are optional, so a rejected update is
+                    # logged and the session goes on with the server's defaults.
+                    logger.warning(
+                        "Dictate did not apply config.update: %s", self._config_error
+                    )
 
             # endpointing=manual: the turn starts when the key goes down.
-            await self._send({"event": "speech_start"})
+            await ws.speech_start(self._event("speech_start"))
         except StreamingError:
             await self.cancel()
             raise
@@ -352,9 +432,10 @@ class DictateRealtimeTranscriber:
             # Whatever is still buffered is the tail of the utterance: send it
             # before speech_end or the last word of every recording is lost.
             await self._flush_audio()
+            # The SDK names each sender after the event it sends.
             for name in ("speech_end", "end"):
                 try:
-                    await self._send({"event": name})
+                    await getattr(ws, name)(self._event(name))
                 except Exception as exc:
                     logger.debug("cannot send %s: %s", name, self._scrub(str(exc)))
                     if self._error is None:
@@ -402,23 +483,23 @@ class DictateRealtimeTranscriber:
         the contract calls losing results, and it leaves the server holding a
         turn it will never close. Unlike :meth:`finish` this does not wait for
         ``session.end`` - the results are being thrown away - but the receiver
-        and keepalive tasks are always joined, so a cancelled session never
-        leaves a task behind.
+        and keepalive tasks are always joined and the SDK's context manager is
+        always exited, so a cancelled session never leaves a task behind.
         """
         send_end = self._ws is not None and not self._end_sent and not self._closed
         self._finished = True
         await self._close(send_end=send_end)
 
-    # -- pre-flight and the wire ------------------------------------------
+    # -- pre-flight and the connect arguments ------------------------------
 
     def _preflight(self) -> None:
         """Refuse a configuration the Dictate socket cannot serve.
 
-        Every check runs before any transport work, so a misconfigured daemon
-        never opens a socket: no key at all (``no_api_key``), a ``mode``
-        Dictate does not have (``config_invalid`` - it has no ``translate``), and
-        a sample rate the socket refuses (``config_invalid``; anything but 16000
-        or 8000 is answered 400 at the handshake).
+        Every check runs before any client or socket work, so a misconfigured
+        daemon never opens a connection: no key at all (``no_api_key``), a
+        ``mode`` Dictate does not have (``config_invalid`` - it has no
+        ``translate``), and a sample rate the socket refuses (``config_invalid``;
+        anything but 16000 or 8000 is answered 400 at the handshake).
         """
         if not (self._config.api_key or "").strip():
             raise StreamingError(
@@ -460,39 +541,38 @@ class DictateRealtimeTranscriber:
         """The configured ``stream_type``, defaulted. It sets the chunk limit."""
         return self._config.dictate_stream_type or DEFAULT_DICTATE_STREAM_TYPE
 
-    def _url(self) -> str:
-        """The handshake URL: every setting that cannot change later, in order.
+    def _connect_kwargs(self) -> dict[str, Any]:
+        """Build the ``connect()`` keyword arguments for this configuration.
 
-        ``sample_rate`` is a string here because the contract declares it as
-        one; ``model`` is omitted entirely when the user pinned nothing, so the
-        server's own default applies; ``language_code`` falls back to ``auto``,
-        which is a real value on this socket rather than "leave it out".
+        These are the settings the contract cannot change after the handshake,
+        so they are handed to the SDK instead of a URL it would build for us.
+        ``sample_rate`` is a string because the SDK declares it as one;
+        ``model`` is ``None`` when the user pinned nothing, so the server's own
+        default applies; ``language_code`` falls back to ``auto``, which is a
+        real value on this socket rather than "leave it out" - an empty
+        ``[api] language_code`` means *detect*, and ``auto`` is how you say so.
         """
-        params: list[tuple[str, str]] = [
-            ("language_code", self._config.language_code or DEFAULT_DICTATE_LANGUAGE),
-            ("mode", self._config.mode),
-        ]
         model = (self._config.dictate_model or "").strip()
-        if model:
-            params.append(("model", model))
-        params.extend(
-            [
-                ("encoding", DEFAULT_ENCODING),
-                ("sample_rate", str(self._config.sample_rate)),
-                ("stream_type", self._stream_type()),
-                ("endpointing", DEFAULT_ENDPOINTING),
-            ]
-        )
-        return f"{DICTATE_WS_URL}?{urlencode(params)}"
+        return {
+            "language_code": self._config.language_code or DEFAULT_DICTATE_LANGUAGE,
+            "mode": self._config.mode,
+            "model": model or None,
+            "endpointing": DEFAULT_ENDPOINTING,
+            "stream_type": self._stream_type(),
+            "encoding": DEFAULT_ENCODING,
+            "sample_rate": str(self._config.sample_rate),
+        }
 
-    def _config_update(self) -> dict[str, Any]:
-        """Build the single ``config.update`` for this session.
+    def _config_fields(self) -> dict[str, Any]:
+        """The members of the single ``config.update`` for this session.
 
         The three builders are imported here rather than at module scope so this
         module imports when the sibling clip module is absent (tests run without
-        it). Each returns ``None`` for "the user did not set this", and a field
-        the user did not set must not be sent at all - an explicit empty value
-        would clear a server-side default we never asked to change.
+        it), and so the SDK stays optional. Each returns ``None`` for "the user
+        did not set this", and a field the user did not set must not be sent at
+        all - an explicit empty value would clear a server-side default we never
+        asked to change. An empty result means no update is sent at all, because
+        the service refuses an update that changes nothing.
 
         ``output_rules`` is the one setting with no builder: it is a plain string
         from the config, and an empty one means "do not turn the output call on".
@@ -507,26 +587,92 @@ class DictateRealtimeTranscriber:
                 code="internal",
             ) from exc
 
-        message: dict[str, Any] = {"event": "config.update"}
+        fields: dict[str, Any] = {}
         style = style_payload(self._config)
         if style is not None:
-            message["style"] = style
+            fields["style"] = style
         vocabulary = vocabulary_payload(self._config)
         if vocabulary is not None:
-            message["vocabulary"] = vocabulary
+            fields["vocabulary"] = vocabulary
         context = context_payload(self._config)
         if context is not None:
-            message["context"] = context
+            fields["context"] = context
         output_rules = (self._config.dictate_output_rules or "").strip()
         if output_rules:
-            message["output_rules"] = output_rules
-        return message
+            fields["output_rules"] = output_rules
+        return fields
 
     def _chunk_limit(self) -> int:
         """The byte budget of one ``audio_input`` message, in whole samples."""
         seconds = FAST_CHUNK_S if self._stream_type() == "fast" else MAX_CHUNK_S
         samples = int(seconds * self._config.sample_rate)
         return samples * BYTES_PER_SAMPLE
+
+    # -- the SDK boundary --------------------------------------------------
+
+    def _resolve_client(self):
+        """Return the injected client, or build one with the lazily imported SDK."""
+        if self._client is not None:
+            return self._client
+        try:
+            import sarvamai  # imported here so the SDK stays optional
+        except ModuleNotFoundError as exc:
+            raise StreamingError(
+                "the sarvamai SDK is not installed; install it with "
+                f"pip install '{SDK_REQUIREMENT}' and start the dictation again",
+                code="internal",
+            ) from exc
+
+        # The Dictate clients only exist from 0.1.49 on, so an older SDK that
+        # still imports is as unusable as a missing one - and saying so is far
+        # more useful than a traceback about a missing attribute.
+        if getattr(sarvamai, "DictateConfigUpdate", None) is None:
+            raise StreamingError(
+                "the installed sarvamai SDK is too old for the Dictate socket; "
+                f"upgrade it with pip install '{SDK_REQUIREMENT}'",
+                code="internal",
+            )
+
+        self._models = {
+            "audio_input": sarvamai.DictateAudioInput,
+            "speech_start": sarvamai.DictateSpeechStart,
+            "speech_end": sarvamai.DictateSpeechEnd,
+            "end": sarvamai.DictateEnd,
+            "ping": sarvamai.DictatePing,
+            "config_update": sarvamai.DictateConfigUpdate,
+        }
+        try:
+            return sarvamai.AsyncSarvamAI(api_subscription_key=self._config.api_key)
+        except Exception as exc:  # the SDK raises its own types on bad input
+            raise StreamingError(
+                f"cannot create the Sarvam client: {self._scrub(str(exc))}",
+                code="api",
+            ) from exc
+
+    def _event(self, name: str, **fields: Any) -> Any:
+        """Build the request model for ``name`` (SDK model, or a stand-in).
+
+        The builders in the sibling clip module may return plain dicts or SDK
+        models, and this module deliberately does not care which: whatever they
+        return is handed straight to the SDK model, which accepts either. The
+        clip models and the streaming models are separate classes in the SDK,
+        though, and pydantic refuses one where the other is declared - so if the
+        SDK rejects the values, they are re-handed as their own ``dict()`` dump,
+        which every SDK model does accept. That keeps this module working
+        whichever shape the sibling ends up returning, without importing
+        anything from it at module scope.
+        """
+        factory = self._models.get(name)
+        if factory is None:
+            return _Request(event=_REQUEST_EVENTS.get(name, name), **fields)
+        try:
+            return factory(**fields)
+        except Exception:
+            normalised = {key: _plain(value) for key, value in fields.items()}
+            if normalised == fields:  # nothing to gain, so surface the real error
+                raise
+            logger.debug("re-handed %s to the SDK as plain values", name)
+            return factory(**normalised)
 
     # -- receiver ---------------------------------------------------------
 
@@ -535,7 +681,7 @@ class DictateRealtimeTranscriber:
         ws = self._ws
         while ws is not None and not self._closed and not self._fatal:
             try:
-                raw = await ws.recv()
+                message = await ws.recv()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -544,7 +690,7 @@ class DictateRealtimeTranscriber:
                 self._note_close(exc)
                 break
             try:
-                self._handle(_decode(raw))
+                self._handle(message)
             except Exception as exc:  # a malformed message must not kill the session
                 logger.debug("ignoring unusable Dictate message: %s", self._scrub(str(exc)))
             if self._session_end_received:
@@ -646,7 +792,9 @@ class DictateRealtimeTranscriber:
         A non-fatal error is logged and the session continues - except while
         ``config.update`` is unconfirmed, where it is also the answer that
         releases the wait (a rejected update arrives as ``invalid_config`` and
-        never as ``config.updated``).
+        never as ``config.updated``). That case is not an error at all: the
+        settings are optional, so the session carries on with the server's
+        defaults.
         """
         code = _as_text(_field(message, "code")) or "unknown"
         detail = _as_text(_field(message, "message"))
@@ -673,11 +821,13 @@ class DictateRealtimeTranscriber:
     def _note_close(self, exc: Exception) -> None:
         """Record why the socket stopped, and map a dead link to ``network``.
 
-        ``1000`` is the normal end after ``session.end``; every other documented
-        code means the link died under us (protocol error, no message for 60 s,
-        message too large, recognition stopped, service overloaded, keepalive
-        timeout). ``1012`` finishes open turns when it can - if it managed,
-        ``session.end`` has already arrived and this is not an error.
+        The SDK does not wrap the transport's close frame, so the code is read
+        off the exception it raised. ``1000`` is the normal end after
+        ``session.end``; every other documented code means the link died under
+        us (protocol error, no message for 60 s, message too large, recognition
+        stopped, service overloaded, keepalive timeout). ``1012`` finishes open
+        turns when it can - if it managed, ``session.end`` has already arrived
+        and this is not an error.
         """
         code = _close_code(exc)
         self._close_code = code
@@ -718,7 +868,7 @@ class DictateRealtimeTranscriber:
             if self._closed or self._end_sent:
                 return
             try:
-                await self._send({"event": "ping"})
+                await ws.ping(self._event("ping"))
             except Exception as exc:
                 logger.debug("cannot send ping: %s", self._scrub(str(exc)))
                 return
@@ -777,13 +927,6 @@ class DictateRealtimeTranscriber:
 
     # -- sending ----------------------------------------------------------
 
-    async def _send(self, payload: dict[str, Any]) -> None:
-        """Send one JSON message. The caller decides whether a failure matters."""
-        ws = self._ws
-        if ws is None:
-            raise StreamingError("the Dictate session is not open", code="internal")
-        await ws.send(json.dumps(payload, ensure_ascii=False))
-
     async def _send_audio(self, block: bytes) -> None:
         """Send one ``audio_input`` message: base64 of raw samples, no header.
 
@@ -793,9 +936,13 @@ class DictateRealtimeTranscriber:
         """
         if not block:
             return
+        ws = self._ws
+        if ws is None:
+            logger.debug("dropping audio chunk: the Dictate session is not open")
+            return
         audio = base64.b64encode(block).decode("ascii")
         try:
-            await self._send({"event": "audio_input", "audio": audio})
+            await ws.send_audio(self._event("audio_input", audio=audio))
         except Exception as exc:
             # A dead socket during capture is reported by finish()/cancel();
             # dropping a chunk keeps the daemon's drain task alive meanwhile.
@@ -812,16 +959,17 @@ class DictateRealtimeTranscriber:
     # -- closing ----------------------------------------------------------
 
     async def _close(self, send_end: bool) -> None:
-        """End the session: optional ``end``, join both tasks, close the socket.
+        """End the session: optional ``end``, join both tasks, exit the context.
 
         Safe to call more than once, and always joins the receiver and the
-        keepalive, so neither outlives the transcriber.
+        keepalive and exits the SDK's context manager, so neither a task nor the
+        socket outlives the transcriber.
         """
         self._closed = True
         ws = self._ws
         if ws is not None and send_end:
             try:
-                await self._send({"event": "end"})
+                await ws.end(self._event("end"))
                 self._end_sent = True
             except Exception as exc:
                 logger.debug("cannot send end: %s", self._scrub(str(exc)))
@@ -833,16 +981,18 @@ class DictateRealtimeTranscriber:
             if not task.done():
                 task.cancel()
         if tasks:
-            # gather() never raises for a cancelled or failed task.
+            # gather() never raises for a cancelled or failed task, so the
+            # context manager is always exited below.
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        ctx, self._ctx = self._ctx, None
         self._ws = None
         self._buffer.clear()
-        if ws is not None:
+        if ctx is not None:
             try:
-                await ws.close()
+                await ctx.__aexit__(None, None, None)
             except Exception as exc:  # closing a broken socket is not an error
-                logger.debug("error while closing the Dictate socket: %s", self._scrub(str(exc)))
+                logger.debug("error while closing the Dictate session: %s", self._scrub(str(exc)))
 
     # -- helpers ----------------------------------------------------------
 
@@ -897,34 +1047,12 @@ class DictateRealtimeTranscriber:
         """True when at least one finished turn has something to type."""
         return any(text.strip() for text in self._turns.values())
 
-    def _resolve_connector(self):
-        """Return the injected connector, or the lazily imported transport.
-
-        ``websockets`` is imported here, not at module scope, so this module
-        imports - and its tests run - on a machine without the package. An
-        injected client bypasses this entirely.
-        """
-        if self._client is not None:
-            return self._client
-        try:  # websockets >= 13
-            from websockets.asyncio.client import connect as _connect_impl
-        except ModuleNotFoundError:
-            try:  # websockets 10-12
-                from websockets import connect as _connect_impl
-            except ModuleNotFoundError as exc:
-                raise StreamingError(
-                    "the websockets package is not installed "
-                    "(pip install websockets)",
-                    code="internal",
-                ) from exc
-        return _connect_impl
-
     def _map_exception(self, exc: Exception) -> StreamingError:
-        """Convert a transport/handshake exception into a StreamingError.
+        """Convert an SDK/transport exception into a StreamingError.
 
-        A 403 at the handshake is ``api``, not ``network``: the contract refuses
-        a bad key before the upgrade, so the failure is the server rejecting our
-        credentials, not a broken link.
+        A 401/403 at the handshake is ``api``, not ``network``: the contract
+        refuses a bad key before the upgrade, so the failure is the server
+        rejecting our credentials, not a broken link.
         """
         message = self._scrub(str(exc)) or exc.__class__.__name__
         status = _status_code(exc)
@@ -961,42 +1089,29 @@ class DictateRealtimeTranscriber:
 # --------------------------------------------------------------------------
 
 
-async def _connect(connector, url: str, headers: dict[str, str]):
-    """Open the socket with the injected connector or ``websockets.connect``.
+def _plain(value: Any) -> Any:
+    """Best-effort plain-data form of ``value``, for re-handing it to the SDK.
 
-    ``additional_headers`` is the current spelling; websockets 10 and 11 call it
-    ``extra_headers`` and reject the other keyword with ``TypeError`` before any
-    network work, so one retry covers both without probing the version.
+    The SDK's request models accept dicts and their own model classes, and the
+    sibling clip module may hand this module the clip models instead (the two
+    families are separate pydantic classes). Anything that knows how to dump
+    itself as a dict is dumped; a list is dumped member by member; everything
+    else is passed through untouched, so this can only ever widen what the SDK
+    accepts.
     """
-    if not callable(connector):
-        connector = connector.connect
-    try:
-        result = connector(url, additional_headers=headers)
-    except TypeError:
-        result = connector(url, extra_headers=headers)
-    # ``inspect.isawaitable``, not ``iscoroutine``: from websockets 13 on,
-    # ``connect`` is a *class*, and an instance of it is awaitable through
-    # ``__await__`` while being neither a coroutine nor a Future. Testing for
-    # those two shapes returns the un-awaited object, and the session then dies
-    # on its first ``recv`` with "'connect' object has no attribute 'recv'" -
-    # a bug no injected-connector test can see, because a fake connector
-    # returns a plain coroutine.
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-def _decode(raw: Any) -> Any:
-    """Turn one wire message into a dict. Bytes are decoded first (1007 rule)."""
-    if isinstance(raw, (bytes, bytearray, memoryview)):
-        raw = bytes(raw).decode("utf-8")
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return raw
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    dump = getattr(value, "dict", None)
+    if callable(dump):
+        try:
+            return dump(exclude_none=True)
+        except TypeError:  # pragma: no cover - a dump() without that keyword
+            return dump()
+    return value
 
 
 def _field(message: Any, name: str) -> Any:
-    """Read ``name`` from a mapping or an object; ``None`` when absent."""
+    """Read ``name`` from an SDK event model or a plain dict; ``None`` when absent."""
     if isinstance(message, dict):
         return message.get(name)
     return getattr(message, name, None)
@@ -1029,28 +1144,27 @@ def _utterance_index(message: Any, fallback: int) -> int:
 
 
 def _status_code(exc: Exception) -> int | None:
-    """Best-effort extraction of an HTTP status from a handshake exception."""
+    """Best-effort extraction of an HTTP status from an SDK exception."""
     for attribute in ("status_code", "status"):
         value = getattr(exc, attribute, None)
         if isinstance(value, int) and not isinstance(value, bool):
             return value
     response = getattr(exc, "response", None)
-    for owner in (response, getattr(response, "response", None)):
-        value = getattr(owner, "status_code", None)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     return None
 
 
 def _close_code(exc: Exception) -> int | None:
-    """The WebSocket close code carried by ``exc``, when it carries one.
+    """The socket close code carried by ``exc``, when it carries one.
 
-    ``websockets`` exposes it as ``.code`` (and on ``.rcvd``/``.sent``); a bare
-    exception carries none, which means the link failed without a close frame.
+    The SDK does not translate transport failures, so the code is wherever the
+    underlying library put it: on the close frames (``rcvd``/``sent``) first,
+    then on the exception itself. A bare exception carries none, which means the
+    link failed without a close frame. Nothing here imports that library - the
+    attributes are read by name.
     """
-    # The close frames first: ``ConnectionClosed.code`` still works but emits a
-    # DeprecationWarning on every abnormal close (websockets 13.1+), and a
-    # daemon that warns once per dropped link trains people to ignore warnings.
     for owner in ("rcvd", "sent", "received", "close_frame"):
         value = getattr(getattr(exc, owner, None), "code", None)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1075,8 +1189,8 @@ def _is_network_error(exc: Exception) -> bool:
 __all__ = [
     "DEFAULT_ENCODING",
     "DEFAULT_ENDPOINTING",
-    "DICTATE_WS_URL",
     "DictateRealtimeTranscriber",
+    "SDK_REQUIREMENT",
     "StreamingError",
     "Transcript",
 ]
