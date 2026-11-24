@@ -69,6 +69,10 @@ FCITX_CONFIGURATION(EngineRowForTest,
 
 namespace {
 
+// Declared in the project's namespace (the macro specialises a template there),
+// used from the anonymous namespace below.
+using fcitx::sarvam::EngineRowForTest;
+
 int failures = 0;
 
 void fail(const std::string &name, const std::string &detail) {
