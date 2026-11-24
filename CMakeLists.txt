@@ -108,6 +108,32 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp")
 
     add_test(NAME clipboard COMMAND clipboard_test)
+
+    # The engine pages and the config.toml marshalling. The first C++ test here
+    # that needs fcitx5 itself, because a Configuration is an fcitx5 type: it
+    # links Fcitx5::Config for the option/Configuration marshalling and
+    # Fcitx5::Utils for the locale helpers those headers pull in. It links the
+    # addon's own translation units rather than the addon target, so it stays
+    # free of the notification module and of anything that needs a live
+    # fcitx5 process.
+    add_executable(engineconfig_test
+        tests/cpp/test_engineconfig.cpp
+        src/sarvamdictationconfig.cpp
+        src/tomlfile.cpp
+        # The audio-device annotation lives in the main page's description and
+        # is defined here; without it the test binary fails to link.
+        src/audiodevices.cpp)
+
+    target_include_directories(engineconfig_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+
+    target_link_libraries(engineconfig_test PRIVATE
+        Fcitx5::Config
+        Fcitx5::Utils)
+
+    add_test(NAME engineconfig COMMAND engineconfig_test)
 endif()
 
 # Daemon-side install rules plus the CPack configuration (TGZ and RPM). Included

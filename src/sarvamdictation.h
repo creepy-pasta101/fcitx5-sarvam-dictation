@@ -46,8 +46,10 @@
 
 namespace fcitx {
 
-// The configuration class lives in fcitx::sarvam with the rest of the settings
-// code; the addon keeps using the bare name.
+// The configuration classes live in fcitx::sarvam with the rest of the settings
+// code; the addon keeps using the bare names.
+using sarvam::DictateSettings;
+using sarvam::SaarasSettings;
 using sarvam::SarvamDictationConfig;
 
 /*
@@ -85,6 +87,16 @@ public:
     const Configuration *getConfig() const override { return &config_; }
     void setConfig(const RawConfig &config) override;
 
+    // The two engine pages, i.e. the Configure button next to the engine
+    // combo. fcitx5 asks for them by the sub-path of
+    // fcitx://config/addon/sarvamdictation/<subPath> (dbusmodule.cpp:351-378)
+    // and the dialog fails with "Failed to get addon config" when the answer
+    // is nullptr (:387-388), so both names always answer.
+    const Configuration *getSubConfig(const std::string &subPath) const
+        override;
+    void setSubConfig(const std::string &subPath,
+                      const RawConfig &config) override;
+
     /// Ask a running daemon to re-read config.toml (after the config page saved
     /// it, or when a connection is first established).
     void sendReload();
@@ -109,6 +121,13 @@ private:
     FCITX_ADDON_DEPENDENCY_LOADER(notifications, instance_->addonManager());
 
     std::string socketPath() const;
+
+    /// Write the three pages into config.toml -- the file is one, the pages are
+    /// three -- and ask a running daemon to re-read it. The API key option is
+    /// left holding its masked sentinel, so the page can never show the key,
+    /// and the file never gets the sentinel. Returns false and describes the
+    /// reason in `error` on failure.
+    bool saveDaemonSettings(std::string *error);
 
     void onHotkey(InputContext *inputContext);
     /// Begin a push-to-talk recording: remember the client, stamp the press and
@@ -182,6 +201,12 @@ private:
 
     Instance *instance_;
     SarvamDictationConfig config_;
+    // The engine pages. Separate Configuration objects rather than nested
+    // options: a nested Configuration renders inside the main page as a group
+    // box (fcitx5-configtool configwidget.cpp:213-221) instead of behind the
+    // engine combo's Configure button, and fcitx5 has no way to hide a row.
+    SaarasSettings saarasConfig_;
+    DictateSettings dictateConfig_;
 
     // The real API key, held in memory only while the ApiKey option shows
     // kMaskedApiKey. Filled by reloadConfig(), consulted and refreshed by

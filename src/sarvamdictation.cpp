@@ -555,11 +555,15 @@ std::string friendlyErrorText(const std::string &code) {
     if (code == "audio_failed") {
         return _("Recording failed. Check your microphone.");
     }
+    // Engine-neutral on purpose: the same codes are raised by the speech-to-
+    // text engine and by the Dictate engine, and the daemon's own message is
+    // appended in parentheses by the caller, which is where the specifics
+    // belong.
     if (code == "network") {
-        return _("Could not reach the Sarvam speech-to-text service.");
+        return _("Could not reach the Sarvam service.");
     }
     if (code == "api") {
-        return _("The Sarvam speech-to-text API returned an error.");
+        return _("The Sarvam API returned an error.");
     }
     if (code == "too_long") {
         return _("That recording was too long. Try a shorter dictation.");
@@ -568,8 +572,7 @@ std::string friendlyErrorText(const std::string &code) {
         return _("The dictation daemon hit an internal error.");
     }
     if (code == "config_invalid") {
-        return _("The dictation settings cannot be used with the chosen "
-                 "model.");
+        return _("The dictation settings cannot be used.");
     }
     return _("Dictation failed.");
 }
@@ -722,10 +725,20 @@ SarvamDictation::~SarvamDictation() { closeSocket(); }
 void SarvamDictation::reloadConfig() {
     // Two files, one config page: the addon's own settings come from the fcitx5
     // conf, the daemon's settings from the TOML file the daemon reads too.
-    readAsIni(config_, "conf/sarvamdictation.conf");
+    //
+    // The conf is loaded partially. readAsIni(Configuration &, path) calls
+    // Configuration::load(raw) with partial = false (iniparser.cpp:181-187),
+    // which resets every option the conf does not mention -- i.e. every
+    // daemon-owned one, the engine included -- to its default. The RawConfig
+    // overload keeps them, exactly as setConfig() does, so a reload can no
+    // longer put the page back to defaults behind a failed TOML read.
+    RawConfig iniRaw;
+    readAsIni(iniRaw, "conf/sarvamdictation.conf");
+    config_.load(iniRaw, /*partial=*/true);
     const std::string path = sarvam::daemonConfigPath();
     std::string error;
-    if (!sarvam::loadDaemonConfig(config_, path, &error)) {
+    if (!sarvam::loadDaemonConfig(config_, saarasConfig_, dictateConfig_, path,
+                                  &error)) {
         // Never fail the addon over a bad file: the daemon settings keep their
         // defaults and the user sees the reason when they press Apply.
         FCITX_SARVAMDICTATION_DEBUG()
@@ -745,7 +758,13 @@ void SarvamDictation::setConfig(const RawConfig &config) {
     // Read before the load, because switching the new option off has to take
     // the composition that is already in the field away now.
     const bool preeditPartialsBefore = config_.preeditPartials.value();
-    config_.load(config, true);
+    // partial = true is load-bearing. The frontend sends back the options of
+    // the page that was open, and a sub-page that was never opened sends
+    // nothing at all -- and a full load resets every absent option to its
+    // default (configuration.cpp:109-118), which would silently wipe the engine
+    // settings the user did not look at this time. Do not "fix" this to a full
+    // load.
+    config_.load(config, /*partial=*/true);
 
     // The API key field is write-only. Unchanged sentinel: put the stored
     // key back. Empty field: the user cleared it, so forget the key. Anything
@@ -801,25 +820,83 @@ void SarvamDictation::setConfig(const RawConfig &config) {
                              config_.appendSpace.value() ? "True" : "False");
     safeSaveAsIni(addonOnly, "conf/sarvamdictation.conf");
 
-    const std::string path = sarvam::daemonConfigPath();
+    // Writes all three pages, masks the key again and tells a running daemon to
+    // re-read the file it just got. The masking happens inside, so the key the
+    // user just typed cannot stay visible in the field until the next reload
+    // even when the write fails.
     std::string error;
-    if (!sarvam::saveDaemonConfig(config_, path, &error)) {
-        FCITX_SARVAMDICTATION_DEBUG()
-            << "cannot write " << path << ": " << error;
+    if (!saveDaemonSettings(&error)) {
         showErrorNotification(_("Could not save settings"), error);
         return;
     }
+}
 
-    // Mask the key again straight away. The configuration page reads
-    // getConfig() back after Apply, so without this the key the user just typed
-    // would stay visible in the field until the next reload.
-    if (!storedApiKey_.empty()) {
-        config_.apiKey.setValue(std::string(kMaskedApiKey));
+const Configuration *
+SarvamDictation::getSubConfig(const std::string &subPath) const {
+    // The sub-path is everything after the addon name in
+    // fcitx://config/addon/sarvamdictation/<subPath>, and the two names are the
+    // last segment of the URIs the engine combo's description carries
+    // (kSaarasSubConfigUri / kDictateSubConfigUri in sarvamdictationconfig.h).
+    // Both always answer, whatever the engine is set to: the frontend can ask
+    // for either one and a nullptr makes the dialog fail.
+    if (subPath == sarvam::kSaarasSubConfigName) {
+        return &saarasConfig_;
+    }
+    if (subPath == sarvam::kDictateSubConfigName) {
+        return &dictateConfig_;
+    }
+    return nullptr;
+}
+
+void SarvamDictation::setSubConfig(const std::string &subPath,
+                                   const RawConfig &config) {
+    // Partial, for the same reason as setConfig(): the frontend sends only the
+    // options of the page it opened, and a full load would reset every other
+    // option of that page to its default.
+    if (subPath == sarvam::kSaarasSubConfigName) {
+        saarasConfig_.load(config, /*partial=*/true);
+    } else if (subPath == sarvam::kDictateSubConfigName) {
+        dictateConfig_.load(config, /*partial=*/true);
+    } else {
+        return;
     }
 
+    // A sub-page's OK button saves it straight away, without the main dialog
+    // being accepted (fcitx5-configtool configwidget.cpp:186-188), so the
+    // change has to reach config.toml from here rather than from setConfig().
+    std::string error;
+    if (!saveDaemonSettings(&error)) {
+        showErrorNotification(_("Could not save settings"), error);
+    }
+}
+
+bool SarvamDictation::saveDaemonSettings(std::string *error) {
+    // Between loads the API key option holds kMaskedApiKey, never the key, so
+    // the file has to be handed the real one -- and the option has to be masked
+    // again afterwards whatever the outcome, so a failed write cannot leave the
+    // key on the page.
+    if (config_.apiKey.value() == kMaskedApiKey) {
+        config_.apiKey.setValue(storedApiKey_);
+    }
+    const std::string path = sarvam::daemonConfigPath();
+    std::string failure;
+    const bool ok = sarvam::saveDaemonConfig(config_, saarasConfig_,
+                                             dictateConfig_, path, &failure);
+    config_.apiKey.setValue(storedApiKey_.empty()
+                                ? std::string()
+                                : std::string(kMaskedApiKey));
+    if (!ok) {
+        FCITX_SARVAMDICTATION_DEBUG()
+            << "cannot write " << path << ": " << failure;
+        if (error) {
+            *error = failure;
+        }
+        return false;
+    }
     // A daemon that is already running still holds the old values; tell it to
     // re-read the file it just got.
     sendReload();
+    return true;
 }
 
 void SarvamDictation::sendReload() {
